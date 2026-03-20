@@ -76,6 +76,9 @@ Current production template already points at the strongest local-tested configu
 - `MUON_WEIGHT_DECAY=0.02`
 - `QK_GAIN_INIT=1.3`
 - `RESID_MIX_SHARPNESS=5.5`
+- `SEQ_WARMUP_MIN_LEN=256`
+- `SEQ_WARMUP_STEPS=24`
+- `SEQ_WARMUP_PHASES=4`
 
 Challenge constraints from the repo root README that this folder is designed to satisfy:
 
@@ -87,3 +90,4 @@ Challenge constraints from the repo root README that this folder is designed to 
 Practical note:
 
 - The official score comes from the final exported-model evaluation, so the production env disables periodic validation during training to preserve as many train steps as possible inside the 600-second wallclock.
+- The production env now uses the strongest time-to-quality Sequence Length Warmup (SLW) variant found so far, because it stays essentially tied with the best local quality while being more likely to help cloud wallclock efficiency.

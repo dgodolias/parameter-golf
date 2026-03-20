@@ -83,6 +83,9 @@ class Hyperparameters:
     warmup_steps = int(os.environ.get("WARMUP_STEPS", 20))
     train_batch_tokens = int(os.environ.get("TRAIN_BATCH_TOKENS", 524_288))
     train_seq_len = int(os.environ.get("TRAIN_SEQ_LEN", 1024))
+    seq_warmup_min_len = int(os.environ.get("SEQ_WARMUP_MIN_LEN", 0))
+    seq_warmup_steps = int(os.environ.get("SEQ_WARMUP_STEPS", 0))
+    seq_warmup_phases = int(os.environ.get("SEQ_WARMUP_PHASES", 4))
     eval_seq_len = int(os.environ.get("EVAL_SEQ_LEN", 0))  # 0 = same as train_seq_len
     eval_stride = int(os.environ.get("EVAL_STRIDE", 0))  # 0 = non-overlapping; >0 = sliding window
     eval_batch_seqs = int(os.environ.get("EVAL_BATCH_SEQS", 256))
@@ -1168,6 +1171,24 @@ def main() -> None:
         for opt in optimizers:
             opt.zero_grad(set_to_none=True)
 
+    def train_seq_len_for_step(step_idx: int) -> int:
+        if args.seq_warmup_steps <= 0 or args.seq_warmup_min_len <= 0:
+            return args.train_seq_len
+        min_len = min(args.seq_warmup_min_len, args.train_seq_len)
+        if min_len >= args.train_seq_len:
+            return args.train_seq_len
+        phases = max(args.seq_warmup_phases, 1)
+        if step_idx >= args.seq_warmup_steps:
+            return args.train_seq_len
+        phase_idx = min((step_idx * phases) // max(args.seq_warmup_steps, 1), phases - 1)
+        if phases == 1:
+            raw_len = min_len
+        else:
+            frac = phase_idx / (phases - 1)
+            raw_len = int(round(min_len + frac * (args.train_seq_len - min_len)))
+        aligned_len = max(64, min(args.train_seq_len, (raw_len // 64) * 64))
+        return aligned_len if args.train_seq_len % aligned_len == 0 else args.train_seq_len
+
     max_wallclock_ms = 1000.0 * args.max_wallclock_seconds if args.max_wallclock_seconds > 0 else None
 
     def lr_mul(step: int, elapsed_ms: float) -> float:
@@ -1188,11 +1209,12 @@ def main() -> None:
         initial_optimizer_states = [copy.deepcopy(opt.state_dict()) for opt in optimizers]
         model.train()
         for warmup_step in range(args.warmup_steps):
+            curr_seq_len = train_seq_len_for_step(warmup_step)
             zero_grad_all()
             for micro_step in range(grad_accum_steps):
                 if distributed:
                     model.require_backward_grad_sync = micro_step == grad_accum_steps - 1
-                x, y = train_loader.next_batch(args.train_batch_tokens, args.train_seq_len, grad_accum_steps)
+                x, y = train_loader.next_batch(args.train_batch_tokens, curr_seq_len, grad_accum_steps)
                 with torch.autocast(device_type="cuda", dtype=torch.bfloat16, enabled=True):
                     warmup_loss = model(x, y)
                 (warmup_loss * grad_scale).backward()
@@ -1217,6 +1239,7 @@ def main() -> None:
     stop_after_step: int | None = None
     torch.cuda.synchronize()
     t0 = time.perf_counter()
+    last_logged_train_seq_len: int | None = None
 
     step = 0
     while True:
@@ -1255,12 +1278,16 @@ def main() -> None:
 
         elapsed_ms = training_time_ms + 1000.0 * (time.perf_counter() - t0)
         scale = lr_mul(step, elapsed_ms)
+        curr_seq_len = train_seq_len_for_step(step)
+        if curr_seq_len != last_logged_train_seq_len:
+            log0(f"train_seq_len_schedule:step:{step} seq_len:{curr_seq_len}")
+            last_logged_train_seq_len = curr_seq_len
         zero_grad_all()
         train_loss = torch.zeros((), device=device)
         for micro_step in range(grad_accum_steps):
             if distributed:
                 model.require_backward_grad_sync = micro_step == grad_accum_steps - 1
-            x, y = train_loader.next_batch(args.train_batch_tokens, args.train_seq_len, grad_accum_steps)
+            x, y = train_loader.next_batch(args.train_batch_tokens, curr_seq_len, grad_accum_steps)
             with torch.autocast(device_type="cuda", dtype=torch.bfloat16, enabled=True):
                 loss = model(x, y)
             train_loss += loss.detach()
