@@ -76,6 +76,10 @@ class Hyperparameters:
     val_batch_size = int(os.environ.get("VAL_BATCH_SIZE", 524_288))
     val_loss_every = int(os.environ.get("VAL_LOSS_EVERY", 1000))
     train_log_every = int(os.environ.get("TRAIN_LOG_EVERY", 200))
+    log_first_n_steps = int(os.environ.get("LOG_FIRST_N_STEPS", 0))
+    log_optimizer_step_ms = bool(int(os.environ.get("LOG_OPTIMIZER_STEP_MS", "0")))
+    log_startup_times = bool(int(os.environ.get("LOG_STARTUP_TIMES", "0")))
+    log_phase_timings = bool(int(os.environ.get("LOG_PHASE_TIMINGS", "0")))
 
     # Training length.
     iterations = int(os.environ.get("ITERATIONS", 20000))
@@ -293,7 +297,7 @@ def eval_val(
     val_byte_count = torch.zeros((), device=device, dtype=torch.float64)
 
     model.eval()
-    with torch.inference_mode():
+    with torch.no_grad():
         for batch_seq_start in range(seq_start, seq_end, local_batch_seqs):
             batch_seq_end = min(batch_seq_start + local_batch_seqs, seq_end)
             raw_start = batch_seq_start * seq_len
@@ -877,7 +881,7 @@ def eval_val_sliding(
     tok_count = torch.zeros((), device=device, dtype=torch.float64)
     byte_count = torch.zeros((), device=device, dtype=torch.float64)
 
-    with torch.inference_mode():
+    with torch.no_grad():
         for i in range(0, len(my_windows), eval_batch_seqs):
             batch = my_windows[i : i + eval_batch_seqs]
             bs = len(batch)
@@ -1204,11 +1208,21 @@ def main() -> None:
 
     # Warmup primes the compiled forward/backward/optimizer paths, then we restore the
     # initial weights/optimizer state so measured training starts from the true init.
+    process_start_time = time.perf_counter()
+    startup_first_warmup_logged = False
+    warmup_start_time: float | None = None
+    warmup_end_time: float | None = None
     if args.warmup_steps > 0:
         initial_model_state = {name: tensor.detach().cpu().clone() for name, tensor in base_model.state_dict().items()}
         initial_optimizer_states = [copy.deepcopy(opt.state_dict()) for opt in optimizers]
         model.train()
+        warmup_start_time = time.perf_counter()
         for warmup_step in range(args.warmup_steps):
+            if args.log_startup_times and not startup_first_warmup_logged:
+                log0(
+                    f"startup_timing:process_to_first_warmup_ms:{1000.0 * (time.perf_counter() - process_start_time):.0f}"
+                )
+                startup_first_warmup_logged = True
             curr_seq_len = train_seq_len_for_step(warmup_step)
             zero_grad_all()
             for micro_step in range(grad_accum_steps):
@@ -1223,6 +1237,7 @@ def main() -> None:
             zero_grad_all()
             if args.warmup_steps <= 20 or (warmup_step + 1) % 10 == 0 or warmup_step + 1 == args.warmup_steps:
                 log0(f"warmup_step:{warmup_step + 1}/{args.warmup_steps}")
+        warmup_end_time = time.perf_counter()
         base_model.load_state_dict(initial_model_state, strict=True)
         for opt, state in zip(optimizers, initial_optimizer_states, strict=True):
             opt.load_state_dict(state)
@@ -1279,7 +1294,7 @@ def main() -> None:
         elapsed_ms = training_time_ms + 1000.0 * (time.perf_counter() - t0)
         scale = lr_mul(step, elapsed_ms)
         curr_seq_len = train_seq_len_for_step(step)
-        if curr_seq_len != last_logged_train_seq_len:
+        if args.log_phase_timings and curr_seq_len != last_logged_train_seq_len:
             log0(f"train_seq_len_schedule:step:{step} seq_len:{curr_seq_len}")
             last_logged_train_seq_len = curr_seq_len
         zero_grad_all()
@@ -1305,27 +1320,49 @@ def main() -> None:
 
         if args.grad_clip_norm > 0:
             torch.nn.utils.clip_grad_norm_(base_model.parameters(), args.grad_clip_norm)
+        optimizer_step_start: float | None = None
+        if args.log_optimizer_step_ms:
+            torch.cuda.synchronize()
+            optimizer_step_start = time.perf_counter()
         for opt in optimizers:
             opt.step()
         # Decoupled weight decay for Muon-optimized matrix params (not built into Muon)
         with torch.no_grad():
             for p in matrix_params:
                 p.mul_(1.0 - args.muon_weight_decay * optimizer_muon.param_groups[0]["lr"])
+        optimizer_step_ms = 0.0
+        if optimizer_step_start is not None:
+            torch.cuda.synchronize()
+            optimizer_step_ms = 1000.0 * (time.perf_counter() - optimizer_step_start)
         update_ema_state()
         update_swa_state()
         zero_grad_all()
 
         step += 1
         approx_training_time_ms = training_time_ms + 1000.0 * (time.perf_counter() - t0)
+        if args.log_startup_times and step == 1:
+            if warmup_start_time is None:
+                log0(f"startup_timing:process_to_first_train_step_ms:{1000.0 * (time.perf_counter() - process_start_time):.0f}")
+            else:
+                log0(f"startup_timing:warmup_total_ms:{1000.0 * ((warmup_end_time or time.perf_counter()) - warmup_start_time):.0f}")
+                log0(f"startup_timing:warmup_end_to_first_train_step_ms:{1000.0 * (time.perf_counter() - (warmup_end_time or process_start_time)):.0f}")
         should_log_train = (
             args.train_log_every > 0
             and (step <= 10 or step % args.train_log_every == 0 or stop_after_step is not None)
         )
-        if should_log_train:
+        if args.log_first_n_steps > 0 and step <= args.log_first_n_steps:
             log0(
+                f"step_timing:{step}/{args.iterations} step_ms:{approx_training_time_ms / step:.2f} "
+                f"train_time:{approx_training_time_ms:.0f}ms optimizer_step_ms:{optimizer_step_ms:.2f}"
+            )
+        if should_log_train:
+            msg = (
                 f"step:{step}/{args.iterations} train_loss:{train_loss.item():.4f} "
                 f"train_time:{approx_training_time_ms:.0f}ms step_avg:{approx_training_time_ms / step:.2f}ms"
             )
+            if args.log_optimizer_step_ms:
+                msg += f" optimizer_step_ms:{optimizer_step_ms:.2f}"
+            log0(msg)
 
         # Needed to sync whether we've reached the wallclock cap.
         reached_cap = max_wallclock_ms is not None and approx_training_time_ms >= max_wallclock_ms
@@ -1415,7 +1452,7 @@ def main() -> None:
         eval_batch_seqs = args.eval_batch_seqs
         warmup_x = torch.zeros(eval_batch_seqs, eval_sl, dtype=torch.int64, device=device)
         base_model.eval()
-        with torch.inference_mode(), torch.autocast(device_type="cuda", dtype=torch.bfloat16):
+        with torch.no_grad(), torch.autocast(device_type="cuda", dtype=torch.bfloat16):
             _ = compiled_logits(warmup_x)
         log0("Compilation done, starting sliding window eval...")
 
