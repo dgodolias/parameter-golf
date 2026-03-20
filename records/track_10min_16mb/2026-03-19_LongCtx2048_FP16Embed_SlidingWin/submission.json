@@ -1,0 +1,33 @@
+{
+  "name": "TBD",
+  "github_id": "TBD",
+  "val_bpb": null,
+  "val_loss": null,
+  "date": "2026-03-19",
+  "track": "10min_16mb",
+  "run_id": "longctx2048_fp16emb_slide64_seed1337",
+  "seed": 1337,
+  "artifact_bytes": null,
+  "code_bytes": null,
+  "model_bytes_int8_zlib": null,
+  "train_seq_len": 2048,
+  "vocab_size": 1024,
+  "num_layers": 9,
+  "model_dim": 512,
+  "num_heads": 8,
+  "num_kv_heads": 4,
+  "mlp_hidden": 960,
+  "tie_embeddings": true,
+  "tied_embed_lr": 0.04,
+  "matrix_lr": 0.032,
+  "scalar_lr": 0.032,
+  "eval_stride": 64,
+  "eval_batch_seqs": 1024,
+  "key_changes": [
+    "TRAIN_SEQ_LEN=2048 (long context training)",
+    "tok_emb.weight stored as fp16 instead of int8 post-quantization",
+    "MLP hidden reduced 1024->960 to fit fp16 embed in 16MB budget",
+    "Sliding window evaluation at stride=64"
+  ],
+  "notes": "Fill in val_bpb, val_loss, artifact_bytes, code_bytes, model_bytes_int8_zlib after official 8xH100 run."
+}
