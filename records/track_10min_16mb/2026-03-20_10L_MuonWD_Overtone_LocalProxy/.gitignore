@@ -1,0 +1,4 @@
+.env
+local_*.txt
+final_model.pt
+final_model.int8.ptz

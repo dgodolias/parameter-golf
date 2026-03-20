@@ -1,0 +1,12 @@
+{
+  "track": "10min_16mb",
+  "date": "2026-03-20",
+  "name": "10L MuonWD Overtone LocalProxy",
+  "author": "dgodolias",
+  "notes": "Branch-local working candidate based on the upstream 10-layer MuonWD+Overtone recipe. Fill in official metrics after cloud runs.",
+  "val_loss": null,
+  "val_bpb": null,
+  "artifact_bytes": null,
+  "code_bytes": null,
+  "model_bytes_int8_zlib": null
+}
