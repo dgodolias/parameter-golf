@@ -83,6 +83,9 @@ class Hyperparameters:
     max_val_seqs = int(os.environ.get("MAX_VAL_SEQS", 0))  # 0 = full validation split
     max_wallclock_seconds = float(os.environ.get("MAX_WALLCLOCK_SECONDS", 600.0))
     qk_gain_init = float(os.environ.get("QK_GAIN_INIT", 1.5))
+    resid_mix_sharpness = float(os.environ.get("RESID_MIX_SHARPNESS", 3.0))
+    attn_scale_init = float(os.environ.get("ATTN_SCALE_INIT", 1.0))
+    mlp_scale_init = float(os.environ.get("MLP_SCALE_INIT", 1.0))
 
     # Model shape.
     vocab_size = int(os.environ.get("VOCAB_SIZE", 1024))
@@ -102,6 +105,7 @@ class Hyperparameters:
     tied_embed_init_std = float(os.environ.get("TIED_EMBED_INIT_STD", 0.005))
     matrix_lr = float(os.environ.get("MATRIX_LR", 0.04))
     scalar_lr = float(os.environ.get("SCALAR_LR", 0.04))
+    muon_weight_decay = float(os.environ.get("MUON_WEIGHT_DECAY", 0.02))
     muon_momentum = float(os.environ.get("MUON_MOMENTUM", 0.95))
     muon_backend_steps = int(os.environ.get("MUON_BACKEND_STEPS", 5))
     muon_momentum_warmup_start = float(os.environ.get("MUON_MOMENTUM_WARMUP_START", 0.85))
@@ -110,6 +114,10 @@ class Hyperparameters:
     beta2 = float(os.environ.get("BETA2", 0.95))
     adam_eps = float(os.environ.get("ADAM_EPS", 1e-8))
     grad_clip_norm = float(os.environ.get("GRAD_CLIP_NORM", 0.0))
+    ema_decay = float(os.environ.get("EMA_DECAY", 0.0))
+    ema_start_step = int(os.environ.get("EMA_START_STEP", 0))
+    swa_start_step = int(os.environ.get("SWA_START_STEP", 0))
+    swa_every = int(os.environ.get("SWA_EVERY", 1))
 
 # -----------------------------
 # MUON OPTIMIZER 
@@ -675,6 +683,8 @@ class Block(nn.Module):
         mlp_mult: int,
         rope_base: float,
         qk_gain_init: float,
+        attn_scale_init: float,
+        mlp_scale_init: float,
         train_seq_len: int = 1024,
     ):
         super().__init__()
@@ -682,8 +692,8 @@ class Block(nn.Module):
         self.mlp_norm = RMSNorm()
         self.attn = CausalSelfAttention(dim, num_heads, num_kv_heads, rope_base, qk_gain_init, train_seq_len=train_seq_len)
         self.mlp = MLP(dim, mlp_mult)
-        self.attn_scale = nn.Parameter(torch.ones(dim, dtype=torch.float32))
-        self.mlp_scale = nn.Parameter(torch.ones(dim, dtype=torch.float32))
+        self.attn_scale = nn.Parameter(torch.full((dim,), attn_scale_init, dtype=torch.float32))
+        self.mlp_scale = nn.Parameter(torch.full((dim,), mlp_scale_init, dtype=torch.float32))
         self.resid_mix = nn.Parameter(torch.stack((torch.ones(dim), torch.zeros(dim))).float())
 
     def forward(self, x: Tensor, x0: Tensor) -> Tensor:
@@ -709,6 +719,9 @@ class GPT(nn.Module):
         logit_softcap: float,
         rope_base: float,
         qk_gain_init: float,
+        resid_mix_sharpness: float,
+        attn_scale_init: float,
+        mlp_scale_init: float,
         train_seq_len: int = 1024,
     ):
         super().__init__()
@@ -717,6 +730,7 @@ class GPT(nn.Module):
         self.tie_embeddings = tie_embeddings
         self.tied_embed_init_std = tied_embed_init_std
         self.logit_softcap = logit_softcap
+        self.resid_mix_sharpness = resid_mix_sharpness
         self.tok_emb = nn.Embedding(vocab_size, model_dim)
         self.num_encoder_layers = num_layers // 2
         self.num_decoder_layers = num_layers - self.num_encoder_layers
@@ -731,6 +745,8 @@ class GPT(nn.Module):
                     mlp_mult,
                     rope_base,
                     qk_gain_init,
+                    attn_scale_init,
+                    mlp_scale_init,
                     train_seq_len=train_seq_len,
                 )
                 for i in range(num_layers)
@@ -757,7 +773,9 @@ class GPT(nn.Module):
         num_layers = len(self.blocks)
         for i, block in enumerate(self.blocks):
             with torch.no_grad():
-                phase = torch.sigmoid(torch.tensor(3.0 * (i / max(num_layers - 1, 1) - 0.5)))
+                phase = torch.sigmoid(
+                    torch.tensor(self.resid_mix_sharpness * (i / max(num_layers - 1, 1) - 0.5))
+                )
                 block.resid_mix.data[0] = phase * torch.ones(block.resid_mix.shape[1])
                 block.resid_mix.data[1] = (1 - phase) * torch.ones(block.resid_mix.shape[1])
 
@@ -1015,6 +1033,9 @@ def main() -> None:
         logit_softcap=args.logit_softcap,
         rope_base=args.rope_base,
         qk_gain_init=args.qk_gain_init,
+        resid_mix_sharpness=args.resid_mix_sharpness,
+        attn_scale_init=args.attn_scale_init,
+        mlp_scale_init=args.mlp_scale_init,
         train_seq_len=args.train_seq_len,
     ).to(device).bfloat16()
     for module in base_model.modules():
@@ -1085,6 +1106,7 @@ def main() -> None:
         f"head_lr:{args.head_lr if base_model.lm_head is not None else 0.0} "
         f"matrix_lr:{args.matrix_lr} scalar_lr:{args.scalar_lr}"
     )
+    log0(f"muon_weight_decay:{args.muon_weight_decay} ema_decay:{args.ema_decay} ema_start_step:{args.ema_start_step}")
     log0(
         f"train_batch_tokens:{args.train_batch_tokens} train_seq_len:{args.train_seq_len} "
         f"iterations:{args.iterations} warmup_steps:{args.warmup_steps} "
@@ -1097,6 +1119,42 @@ def main() -> None:
     # -----------------------------
 
     train_loader = DistributedTokenLoader(args.train_files, rank, world_size, device)
+    ema_state: dict[str, Tensor] | None = None
+    ema_updates = 0
+    swa_state: dict[str, Tensor] | None = None
+    swa_updates = 0
+
+    def init_ema_state() -> dict[str, Tensor]:
+        return {name: tensor.detach().clone() for name, tensor in base_model.state_dict().items()}
+
+    def update_ema_state() -> None:
+        nonlocal ema_state, ema_updates
+        if args.ema_decay <= 0 or step < args.ema_start_step:
+            return
+        current_state = base_model.state_dict()
+        if ema_state is None:
+            ema_state = init_ema_state()
+        decay = args.ema_decay
+        one_minus_decay = 1.0 - decay
+        for name, tensor in current_state.items():
+            ema_state[name].mul_(decay).add_(tensor.detach(), alpha=one_minus_decay)
+        ema_updates += 1
+
+    def update_swa_state() -> None:
+        nonlocal swa_state, swa_updates
+        if args.swa_start_step <= 0 or step < args.swa_start_step:
+            return
+        if args.swa_every <= 0 or step % args.swa_every != 0:
+            return
+        current_state = base_model.state_dict()
+        if swa_state is None:
+            swa_state = {name: tensor.detach().clone() for name, tensor in current_state.items()}
+            swa_updates = 1
+            return
+        coeff = 1.0 / float(swa_updates + 1)
+        for name, tensor in current_state.items():
+            swa_state[name].add_(tensor.detach() - swa_state[name], alpha=coeff)
+        swa_updates += 1
 
     def zero_grad_all() -> None:
         for opt in optimizers:
@@ -1217,7 +1275,9 @@ def main() -> None:
         # Decoupled weight decay for Muon-optimized matrix params (not built into Muon)
         with torch.no_grad():
             for p in matrix_params:
-                p.mul_(1.0 - 0.02 * optimizer_muon.param_groups[0]["lr"])
+                p.mul_(1.0 - args.muon_weight_decay * optimizer_muon.param_groups[0]["lr"])
+        update_ema_state()
+        update_swa_state()
         zero_grad_all()
 
         step += 1
@@ -1250,7 +1310,20 @@ def main() -> None:
     # SERIALIZATION + ROUNDTRIP VALIDATION
     # -----------------------------
     # Save the raw state, then produce the compressed int8+zlib artifact.
-    export_state = dict(base_model.state_dict())
+    eval_state = dict(base_model.state_dict())
+    if swa_state is not None and swa_updates > 0:
+        log0(f"using_swa_for_export:True swa_updates:{swa_updates}")
+        eval_state = {name: tensor.detach().clone() for name, tensor in swa_state.items()}
+        base_model.load_state_dict(eval_state, strict=True)
+    elif ema_state is not None and ema_updates > 0:
+        log0("using_swa_for_export:False")
+        log0(f"using_ema_for_export:True ema_updates:{ema_updates}")
+        eval_state = {name: tensor.detach().clone() for name, tensor in ema_state.items()}
+        base_model.load_state_dict(eval_state, strict=True)
+    else:
+        log0("using_swa_for_export:False")
+        log0("using_ema_for_export:False")
+    export_state = eval_state
     raw_model_path = output_dir / "final_model.pt"
     quant_model_path = output_dir / "final_model.int8.ptz"
 
