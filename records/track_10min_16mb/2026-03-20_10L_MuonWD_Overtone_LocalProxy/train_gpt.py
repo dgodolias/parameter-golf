@@ -9,6 +9,7 @@ from __future__ import annotations
 import copy
 import glob
 import io
+import inspect
 import math
 import os
 import random
@@ -47,6 +48,11 @@ def _load_dotenv() -> None:
 
 
 _load_dotenv()
+
+try:
+    _SDPA_SUPPORTS_GQA = "enable_gqa" in inspect.signature(F.scaled_dot_product_attention).parameters
+except (TypeError, ValueError):
+    _SDPA_SUPPORTS_GQA = False
 
 # -----------------------------
 # HYPERPARAMETERS
@@ -648,14 +654,16 @@ class CausalSelfAttention(nn.Module):
         q = apply_rotary_emb(q, cos, sin)
         k = apply_rotary_emb(k, cos, sin)
         q = q * self.q_gain.to(dtype=q.dtype)[None, :, None, None]
-        y = F.scaled_dot_product_attention(
-            q,
-            k,
-            v,
-            attn_mask=None,
-            is_causal=True,
-            enable_gqa=(self.num_kv_heads != self.num_heads),
-        )
+        if self.num_kv_heads != self.num_heads and not _SDPA_SUPPORTS_GQA:
+            repeat_factor = self.num_heads // self.num_kv_heads
+            k = k.repeat_interleave(repeat_factor, dim=1)
+            v = v.repeat_interleave(repeat_factor, dim=1)
+            y = F.scaled_dot_product_attention(q, k, v, attn_mask=None, is_causal=True)
+        else:
+            sdpa_kwargs = {"attn_mask": None, "is_causal": True}
+            if self.num_kv_heads != self.num_heads and _SDPA_SUPPORTS_GQA:
+                sdpa_kwargs["enable_gqa"] = True
+            y = F.scaled_dot_product_attention(q, k, v, **sdpa_kwargs)
         y = y.transpose(1, 2).contiguous().reshape(bsz, seqlen, dim)
         return self.proj(y)
 
