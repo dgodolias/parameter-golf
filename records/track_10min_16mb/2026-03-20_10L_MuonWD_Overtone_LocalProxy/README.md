@@ -24,6 +24,22 @@ Copy `.env.local` to `.env` in this folder, then run:
 The log will be written into this record folder as `<RUN_ID>.txt`.
 By default this working copy now writes both its log and model artifacts into this record folder.
 
+Current best local 10L proxy found on this branch:
+
+- `TRAIN_SEQ_LEN=1024`
+- `TRAIN_BATCH_TOKENS=8192`
+- `ITERATIONS=60`
+- `WARMDOWN_ITERS=15`
+- `MATRIX_LR=0.06`
+- `SCALAR_LR=0.032`
+- `EVAL_STRIDE=64`
+- `EVAL_BATCH_SEQS=32`
+- `MAX_VAL_SEQS=64`
+
+Best observed local proxy result so far:
+- `final_int8_zlib_roundtrip_exact val_loss: 4.68067869`
+- `val_bpb: 2.76750029`
+
 ## Cloud benchmark
 
 Copy `.env.production` to `.env` in this folder, then run:
