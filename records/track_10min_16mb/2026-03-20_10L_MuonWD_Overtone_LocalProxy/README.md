@@ -68,6 +68,8 @@ For PR packaging, set `LOG_FILE=train.log` so the record folder contains the exp
 
 Current production template already points at the strongest local-tested configuration on this branch:
 
+- `VAL_LOSS_EVERY=0` to avoid burning training-wallclock on periodic full-val passes
+- `TRAIN_LOG_EVERY=250` to keep logs readable with low overhead
 - `MLP_MULT=3`
 - `MATRIX_LR=0.06`
 - `SCALAR_LR=0.032`
@@ -81,3 +83,7 @@ Challenge constraints from the repo root README that this folder is designed to 
 - evaluation also has its own separate `10 minute` limit on `8xH100`
 - total artifact size is `code bytes + compressed model bytes < 16,000,000`
 - leaderboard SOTA submissions must beat the previous SOTA by at least `0.005 nats` with enough logs for significance
+
+Practical note:
+
+- The official score comes from the final exported-model evaluation, so the production env disables periodic validation during training to preserve as many train steps as possible inside the 600-second wallclock.
