@@ -1477,7 +1477,7 @@ def main() -> None:
 
         frac = min(step / args.muon_momentum_warmup_steps, 1.0) if args.muon_momentum_warmup_steps > 0 else 1.0
         muon_momentum = (1 - frac) * args.muon_momentum_warmup_start + frac * args.muon_momentum
-        for group in optimizer_muon.param_groups:
+        for group in optimizer_matrix.param_groups:
             group["momentum"] = muon_momentum
 
         for opt in optimizers:
