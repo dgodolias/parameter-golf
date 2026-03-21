@@ -28,6 +28,11 @@ This integration branch adds researcher conveniences without changing the defaul
   - `LOG_OPTIMIZER_STEP_MS`
   - `LOG_STARTUP_TIMES`
   - `LOG_PHASE_TIMINGS`
+- env-gated compile controls:
+  - `COMPILE_MODEL`
+  - `COMPILE_FULLGRAPH`
+  - `COMPILE_DYNAMIC`
+  - `COMPILE_MUON_BACKEND`
 - safe fallback for older PyTorch builds that do not support `enable_gqa` in `scaled_dot_product_attention`
 - eval cache safety using `torch.no_grad()` instead of `torch.inference_mode()` where cached RoPE tensors are created
 
@@ -57,6 +62,30 @@ export LOG_STARTUP_TIMES=1
 export LOG_PHASE_TIMINGS=0
 ```
 
+For runtime rescue experiments on the same family:
+
+```bash
+# Baseline: current cloud path
+export COMPILE_MODEL=1
+export COMPILE_FULLGRAPH=1
+export COMPILE_DYNAMIC=0
+export COMPILE_MUON_BACKEND=1
+
+# Variant A: relax fullgraph
+export COMPILE_MODEL=1
+export COMPILE_FULLGRAPH=0
+export COMPILE_DYNAMIC=0
+export COMPILE_MUON_BACKEND=1
+
+# Variant B: no model compile, keep Muon backend compile
+export COMPILE_MODEL=0
+export COMPILE_MUON_BACKEND=1
+
+# Variant C: no compile at all
+export COMPILE_MODEL=0
+export COMPILE_MUON_BACKEND=0
+```
+
 ## Local Timing Baseline On This Branch
 
 First local smoke on RTX 4050-class setup (`seq_len=1024`, `60` iters, `MAX_VAL_SEQS=64`) with the raw upstream defaults:
@@ -78,6 +107,27 @@ Interpretation:
 
 - On this local proxy, removing warmup and the step-0 validation preserved score while cutting measured training time by about **34.7%**.
 - This does **not** prove the final cloud score is unchanged, but it is the right kind of time-to-quality move for the active upstream family.
+
+## Active Branch Strategy
+
+This branch now treats `2026-03-20_10L_Int5MLP_MuonWD04_SWA50` as the only active family.
+
+- The old `longctx-swiglu` line is runtime reference only.
+- Runtime rescue comes before deeper score tuning.
+- Score expansion stays inside the same family:
+  - BigramHash
+  - SmearGate
+  - SWA
+  - mixed int5/int6 quantization
+
+The first active runtime track is:
+
+1. `COMPILE_MODEL=1`, `COMPILE_FULLGRAPH=1`
+2. `COMPILE_MODEL=1`, `COMPILE_FULLGRAPH=0`
+3. `COMPILE_MODEL=0`, `COMPILE_MUON_BACKEND=1`
+4. `COMPILE_MODEL=0`, `COMPILE_MUON_BACKEND=0`
+
+Only after the best runtime-safe path is clear do we promote score-side experiments around WD, momentum warmup, SWA, and bigram capacity.
 
 ## 3-Seed Results
 

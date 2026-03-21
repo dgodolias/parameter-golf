@@ -79,6 +79,10 @@ class Hyperparameters:
     log_optimizer_step_ms = bool(int(os.environ.get("LOG_OPTIMIZER_STEP_MS", "0")))
     log_startup_times = bool(int(os.environ.get("LOG_STARTUP_TIMES", "0")))
     log_phase_timings = bool(int(os.environ.get("LOG_PHASE_TIMINGS", "0")))
+    compile_model = bool(int(os.environ.get("COMPILE_MODEL", "1")))
+    compile_fullgraph = bool(int(os.environ.get("COMPILE_FULLGRAPH", "1")))
+    compile_dynamic = bool(int(os.environ.get("COMPILE_DYNAMIC", "0")))
+    compile_muon_backend = bool(int(os.environ.get("COMPILE_MUON_BACKEND", "1")))
 
     iterations = int(os.environ.get("ITERATIONS", 20000))
     warmdown_iters = int(os.environ.get("WARMDOWN_ITERS", 3000))
@@ -868,7 +872,8 @@ def main() -> None:
 
     code = Path(__file__).read_text(encoding="utf-8")
     args = Hyperparameters()
-    zeropower_via_newtonschulz5 = torch.compile(zeropower_via_newtonschulz5)
+    if args.compile_muon_backend:
+        zeropower_via_newtonschulz5 = torch.compile(zeropower_via_newtonschulz5)
 
     distributed = "RANK" in os.environ and "WORLD_SIZE" in os.environ
     rank = int(os.environ.get("RANK", "0"))
@@ -953,6 +958,14 @@ def main() -> None:
     log0(f"val_bpb:enabled tokenizer_kind=sentencepiece tokenizer_path={args.tokenizer_path}")
     log0(f"train_loader:dataset:{dataset_dir.name} train_shards:{actual_train_files}")
     log0(f"val_loader:shards pattern={args.val_files} tokens:{val_tokens.numel() - 1}")
+    log0(
+        "compile_config:"
+        f" model={args.compile_model}"
+        f" fullgraph={args.compile_fullgraph}"
+        f" dynamic={args.compile_dynamic}"
+        f" muon_backend={args.compile_muon_backend}"
+        f" torchdynamo_disable={os.environ.get('TORCHDYNAMO_DISABLE', '0')}"
+    )
 
     # MODEL + OPTIMIZER SETUP
     base_model = GPT(
@@ -974,8 +987,15 @@ def main() -> None:
         if isinstance(module, CastedLinear):
             module.float()
     restore_low_dim_params_to_fp32(base_model)
-    compiled_model = torch.compile(base_model, dynamic=False, fullgraph=True)
-    model: nn.Module = DDP(compiled_model, device_ids=[local_rank], broadcast_buffers=False) if distributed else compiled_model
+    if args.compile_model:
+        train_model = torch.compile(
+            base_model,
+            dynamic=args.compile_dynamic,
+            fullgraph=args.compile_fullgraph,
+        )
+    else:
+        train_model = base_model
+    model: nn.Module = DDP(train_model, device_ids=[local_rank], broadcast_buffers=False) if distributed else train_model
 
     block_named_params = list(base_model.blocks.named_parameters())
     matrix_params = [
