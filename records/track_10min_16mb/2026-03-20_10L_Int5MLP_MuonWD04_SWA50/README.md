@@ -134,6 +134,13 @@ Control candidate:
 - `.env.cloud8gpu_production`
 - `.env.production`
 
+8x proxy wave:
+
+- `.env.cloud8gpu_proxy_control`
+- `.env.cloud8gpu_proxy_batch458752`
+- `.env.cloud8gpu_proxy_batch393216`
+- `.env.cloud8gpu_proxy_batch458752_seq1536`
+
 Experimental branches:
 
 - `.env.cloud1gpu_fa3_2048_524288`
@@ -225,6 +232,12 @@ Final 8xH100 launch helper:
 bash records/track_10min_16mb/2026-03-20_10L_Int5MLP_MuonWD04_SWA50/run_8gpu_production.sh
 ```
 
+8x proxy launch helper:
+
+```bash
+bash records/track_10min_16mb/2026-03-20_10L_Int5MLP_MuonWD04_SWA50/run_8gpu_proxy.sh
+```
+
 Focused `skiplite` sweep:
 
 ```bash
@@ -249,6 +262,13 @@ Final 8xH100 command:
 
 ```bash
 bash records/track_10min_16mb/2026-03-20_10L_Int5MLP_MuonWD04_SWA50/run_8gpu_production.sh
+```
+
+8x proxy command:
+
+```bash
+bash records/track_10min_16mb/2026-03-20_10L_Int5MLP_MuonWD04_SWA50/run_8gpu_proxy.sh \
+  records/track_10min_16mb/2026-03-20_10L_Int5MLP_MuonWD04_SWA50/.env.cloud8gpu_proxy_batch458752
 ```
 
 Useful summary:
