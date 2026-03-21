@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import copy
 import glob
+import importlib
 import inspect
 import io
 import math
@@ -83,6 +84,8 @@ class Hyperparameters:
     compile_fullgraph = bool(int(os.environ.get("COMPILE_FULLGRAPH", "1")))
     compile_dynamic = bool(int(os.environ.get("COMPILE_DYNAMIC", "0")))
     compile_muon_backend = bool(int(os.environ.get("COMPILE_MUON_BACKEND", "1")))
+    attn_backend = os.environ.get("ATTN_BACKEND", "flash2").strip().lower()
+    optimizer_kind = os.environ.get("OPTIMIZER_KIND", "muon").strip().lower()
 
     iterations = int(os.environ.get("ITERATIONS", 20000))
     warmdown_iters = int(os.environ.get("WARMDOWN_ITERS", 3000))
@@ -113,6 +116,8 @@ class Hyperparameters:
     muon_backend_steps = int(os.environ.get("MUON_BACKEND_STEPS", 5))
     muon_momentum_warmup_start = float(os.environ.get("MUON_MOMENTUM_WARMUP_START", 0.92))
     muon_momentum_warmup_steps = int(os.environ.get("MUON_MOMENTUM_WARMUP_STEPS", 1500))
+    normuon_beta2 = float(os.environ.get("NORMUON_BETA2", os.environ.get("BETA2", 0.95)))
+    normuon_eps = float(os.environ.get("NORMUON_EPS", os.environ.get("ADAM_EPS", 1e-8)))
     beta1 = float(os.environ.get("BETA1", 0.9))
     beta2 = float(os.environ.get("BETA2", 0.95))
     adam_eps = float(os.environ.get("ADAM_EPS", 1e-8))
@@ -212,6 +217,115 @@ class Muon(torch.optim.Optimizer):
                 p.add_(g, alpha=-lr)
                 curr += p.numel()
         return loss
+
+
+class NorMuon(torch.optim.Optimizer):
+    def __init__(
+        self,
+        params,
+        lr: float,
+        momentum: float,
+        beta2: float,
+        eps: float,
+        backend_steps: int,
+        nesterov: bool = True,
+        weight_decay: float = 0.0,
+    ):
+        super().__init__(
+            params,
+            dict(
+                lr=lr,
+                momentum=momentum,
+                beta2=beta2,
+                eps=eps,
+                backend_steps=backend_steps,
+                nesterov=nesterov,
+                weight_decay=weight_decay,
+            ),
+        )
+
+    @torch.no_grad()
+    def step(self, closure=None):
+        loss = None
+        if closure is not None:
+            with torch.enable_grad():
+                loss = closure()
+        distributed = dist.is_available() and dist.is_initialized()
+        world_size = dist.get_world_size() if distributed else 1
+        rank = dist.get_rank() if distributed else 0
+
+        for group in self.param_groups:
+            params = group["params"]
+            if not params:
+                continue
+            lr = group["lr"]
+            momentum = group["momentum"]
+            beta2 = group["beta2"]
+            eps = group["eps"]
+            backend_steps = group["backend_steps"]
+            nesterov = group["nesterov"]
+
+            total_params = sum(int(p.numel()) for p in params)
+            updates_flat = torch.zeros(total_params, device=params[0].device, dtype=torch.bfloat16)
+
+            curr = 0
+            for i, p in enumerate(params):
+                if i % world_size == rank and p.grad is not None:
+                    g = p.grad
+                    state = self.state[p]
+                    if "momentum_buffer" not in state:
+                        state["momentum_buffer"] = torch.zeros_like(g)
+                    if "row_second_moment" not in state:
+                        state["row_second_moment"] = torch.zeros(g.size(0), device=g.device, dtype=torch.float32)
+                        state["step"] = 0
+                    buf = state["momentum_buffer"]
+                    buf.mul_(momentum).add_(g)
+                    if nesterov:
+                        g = g.add(buf, alpha=momentum)
+                    g = zeropower_via_newtonschulz5(g, steps=backend_steps)
+                    row_rms = g.float().pow(2).mean(dim=1)
+                    state["step"] += 1
+                    row_second_moment = state["row_second_moment"]
+                    row_second_moment.mul_(beta2).add_(row_rms, alpha=1 - beta2)
+                    bias_correction2 = 1.0 - beta2 ** state["step"]
+                    row_denom = torch.sqrt(row_second_moment / bias_correction2 + eps)
+                    g = g * row_denom.reciprocal().to(dtype=g.dtype)[:, None]
+                    g *= max(1, g.size(0) / g.size(1)) ** 0.5
+                    updates_flat[curr : curr + p.numel()] = g.reshape(-1)
+                curr += p.numel()
+
+            if distributed:
+                dist.all_reduce(updates_flat, op=dist.ReduceOp.SUM)
+
+            wd = group.get("weight_decay", 0.0)
+            curr = 0
+            for p in params:
+                g = updates_flat[curr : curr + p.numel()].view_as(p).to(dtype=p.dtype)
+                if wd > 0:
+                    p.data.mul_(1.0 - lr * wd)
+                p.add_(g, alpha=-lr)
+                curr += p.numel()
+        return loss
+
+
+def get_flash3_attention() -> callable:
+    attempts: list[str] = []
+    candidates = (
+        ("hopper.flash_attn_interface", "flash_attn_func"),
+        ("flash_attn_interface", "flash_attn_func"),
+        ("flash_attn.flash_attn_interface", "flash_attn_func"),
+    )
+    for module_name, attr_name in candidates:
+        try:
+            module = importlib.import_module(module_name)
+            return getattr(module, attr_name)
+        except Exception as exc:
+            attempts.append(f"{module_name}.{attr_name}: {exc}")
+    raise RuntimeError(
+        "ATTN_BACKEND=flash3 requested but FlashAttention-3 is unavailable. "
+        "Expected an H100/Hopper environment with the FA3 Python bindings installed. "
+        f"Import attempts: {' | '.join(attempts)}"
+    )
 
 
 # -----------------------------
@@ -574,6 +688,7 @@ class CausalSelfAttention(nn.Module):
         rope_base: float,
         qk_gain_init: float,
         attn_qk_softcap: float,
+        attn_backend: str,
     ):
         super().__init__()
         if dim % num_heads != 0:
@@ -593,6 +708,8 @@ class CausalSelfAttention(nn.Module):
         self.proj._zero_init = True
         self.q_gain = nn.Parameter(torch.full((num_heads,), qk_gain_init, dtype=torch.float32))
         self.attn_qk_softcap = attn_qk_softcap
+        self.attn_backend = attn_backend
+        self.flash3_attention = get_flash3_attention() if attn_backend == "flash3" else None
         self.rotary = Rotary(self.head_dim, base=rope_base)
 
     def forward(self, x: Tensor) -> Tensor:
@@ -610,7 +727,13 @@ class CausalSelfAttention(nn.Module):
             softcap = q.new_tensor(self.attn_qk_softcap)
             q = softcap * torch.tanh(q / softcap)
             k = softcap * torch.tanh(k / softcap)
-        if _SDPA_SUPPORTS_GQA:
+        if self.attn_backend == "flash3":
+            q_flash = q.transpose(1, 2).contiguous()
+            k_flash = k.transpose(1, 2).contiguous()
+            v_flash = v.transpose(1, 2).contiguous()
+            y = self.flash3_attention(q_flash, k_flash, v_flash, softmax_scale=None, causal=True)
+            y = y.transpose(1, 2)
+        elif _SDPA_SUPPORTS_GQA:
             y = F.scaled_dot_product_attention(
                 q, k, v, attn_mask=None, is_causal=True,
                 enable_gqa=(self.num_kv_heads != self.num_heads),
@@ -687,11 +810,12 @@ class Block(nn.Module):
         rope_base: float,
         qk_gain_init: float,
         attn_qk_softcap: float,
+        attn_backend: str,
     ):
         super().__init__()
         self.attn_norm = RMSNorm()
         self.mlp_norm = RMSNorm()
-        self.attn = CausalSelfAttention(dim, num_heads, num_kv_heads, rope_base, qk_gain_init, attn_qk_softcap)
+        self.attn = CausalSelfAttention(dim, num_heads, num_kv_heads, rope_base, qk_gain_init, attn_qk_softcap, attn_backend)
         self.mlp = MLP(dim, mlp_mult)
         self.attn_scale = nn.Parameter(torch.ones(dim, dtype=torch.float32))
         self.mlp_scale = nn.Parameter(torch.ones(dim, dtype=torch.float32))
@@ -721,6 +845,7 @@ class GPT(nn.Module):
         rope_base: float,
         qk_gain_init: float,
         attn_qk_softcap: float,
+        attn_backend: str,
         bigram_vocab_size: int = 0,
         bigram_dim: int = 128,
     ):
@@ -739,7 +864,7 @@ class GPT(nn.Module):
         self.smear = SmearGate(model_dim)
         self.blocks = nn.ModuleList(
             [
-                Block(model_dim, num_heads, num_kv_heads, mlp_mult, rope_base, qk_gain_init, attn_qk_softcap)
+                Block(model_dim, num_heads, num_kv_heads, mlp_mult, rope_base, qk_gain_init, attn_qk_softcap, attn_backend)
                 for _ in range(num_layers)
             ]
         )
@@ -992,6 +1117,10 @@ def main() -> None:
 
     code = Path(__file__).read_text(encoding="utf-8")
     args = Hyperparameters()
+    if args.attn_backend not in {"flash2", "flash3"}:
+        raise ValueError(f"ATTN_BACKEND must be one of flash2|flash3, got {args.attn_backend}")
+    if args.optimizer_kind not in {"muon", "normuon"}:
+        raise ValueError(f"OPTIMIZER_KIND must be one of muon|normuon, got {args.optimizer_kind}")
     if args.compile_muon_backend:
         zeropower_via_newtonschulz5 = torch.compile(zeropower_via_newtonschulz5)
 
@@ -1013,6 +1142,13 @@ def main() -> None:
         dist.init_process_group(backend="nccl", device_id=device)
         dist.barrier()
     master_process = rank == 0
+    if args.attn_backend == "flash3":
+        device_capability = torch.cuda.get_device_capability(device)
+        if device_capability[0] < 9:
+            raise RuntimeError(
+                f"ATTN_BACKEND=flash3 requires Hopper/H100-class GPUs (SM90+), got capability={device_capability}"
+            )
+        get_flash3_attention()
 
     torch.backends.cuda.matmul.allow_tf32 = True
     torch.backends.cudnn.allow_tf32 = True
@@ -1101,6 +1237,7 @@ def main() -> None:
         rope_base=args.rope_base,
         qk_gain_init=args.qk_gain_init,
         attn_qk_softcap=args.attn_qk_softcap,
+        attn_backend=args.attn_backend,
         bigram_vocab_size=args.bigram_vocab_size,
         bigram_dim=args.bigram_dim,
     )
@@ -1160,14 +1297,26 @@ def main() -> None:
         weight_decay=args.weight_decay,
         fused=True,
     )
-    optimizer_muon = Muon(
-        matrix_params,
-        lr=args.matrix_lr,
-        momentum=args.muon_momentum,
-        backend_steps=args.muon_backend_steps,
-        weight_decay=0.04,
-    )
-    for group in optimizer_muon.param_groups:
+    optimizer_matrix: torch.optim.Optimizer
+    if args.optimizer_kind == "normuon":
+        optimizer_matrix = NorMuon(
+            matrix_params,
+            lr=args.matrix_lr,
+            momentum=args.muon_momentum,
+            beta2=args.normuon_beta2,
+            eps=args.normuon_eps,
+            backend_steps=args.muon_backend_steps,
+            weight_decay=0.04,
+        )
+    else:
+        optimizer_matrix = Muon(
+            matrix_params,
+            lr=args.matrix_lr,
+            momentum=args.muon_momentum,
+            backend_steps=args.muon_backend_steps,
+            weight_decay=0.04,
+        )
+    for group in optimizer_matrix.param_groups:
         group["base_lr"] = args.matrix_lr
     optimizer_scalar = torch.optim.AdamW(
         [{"params": scalar_params, "lr": args.scalar_lr, "base_lr": args.scalar_lr}],
@@ -1176,7 +1325,7 @@ def main() -> None:
         weight_decay=args.weight_decay,
         fused=True,
     )
-    optimizers: list[torch.optim.Optimizer] = [optimizer_tok, optimizer_muon, optimizer_scalar]
+    optimizers: list[torch.optim.Optimizer] = [optimizer_tok, optimizer_matrix, optimizer_scalar]
     if base_model.lm_head is not None:
         optimizer_head = torch.optim.Adam(
             [{"params": [base_model.lm_head.weight], "lr": args.head_lr, "base_lr": args.head_lr}],
@@ -1190,6 +1339,11 @@ def main() -> None:
     log0(f"model_params:{n_params}")
     log0(f"world_size:{world_size} grad_accum_steps:{grad_accum_steps}")
     log0(f"sdp_backends:cudnn={sdp_cudnn} flash={sdp_flash} mem_efficient={sdp_mem_efficient} math={sdp_math}")
+    log0(f"attn_backend:{args.attn_backend}")
+    log0(
+        f"optimizer_kind:{args.optimizer_kind} muon_momentum:{args.muon_momentum} "
+        f"normuon_beta2:{args.normuon_beta2} normuon_eps:{args.normuon_eps}"
+    )
     log0(f"attention_mode:gqa num_heads:{args.num_heads} num_kv_heads:{args.num_kv_heads}")
     log0(
         f"tie_embeddings:{args.tie_embeddings} embed_lr:{token_lr} "
