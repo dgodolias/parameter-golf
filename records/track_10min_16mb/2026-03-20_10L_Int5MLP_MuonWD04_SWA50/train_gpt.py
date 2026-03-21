@@ -132,6 +132,13 @@ class Hyperparameters:
 
     bigram_vocab_size = int(os.environ.get("BIGRAM_VOCAB_SIZE", 10240))
     bigram_dim = int(os.environ.get("BIGRAM_DIM", 128))
+    bigram_scale_init = float(os.environ.get("BIGRAM_SCALE_INIT", 0.05))
+    smear_gate_init = float(os.environ.get("SMEAR_GATE_INIT", 0.0))
+    skip_weights_init = float(os.environ.get("SKIP_WEIGHTS_INIT", 1.0))
+    attn_scale_init = float(os.environ.get("ATTN_SCALE_INIT", 1.0))
+    mlp_scale_init = float(os.environ.get("MLP_SCALE_INIT", 1.0))
+    resid_mix_x_init = float(os.environ.get("RESID_MIX_X_INIT", 1.0))
+    resid_mix_x0_init = float(os.environ.get("RESID_MIX_X0_INIT", 0.0))
 
     swa_enabled = bool(int(os.environ.get("SWA_ENABLED", "1")))
     swa_start_frac = float(os.environ.get("SWA_START_FRAC", 0.4))
@@ -779,9 +786,9 @@ class MLP(nn.Module):
 
 class SmearGate(nn.Module):
     """Blend each token's embedding with the previous token's embedding."""
-    def __init__(self, dim: int):
+    def __init__(self, dim: int, gate_init: float):
         super().__init__()
-        self.gate = nn.Parameter(torch.zeros(dim, dtype=torch.float32))
+        self.gate = nn.Parameter(torch.full((dim,), gate_init, dtype=torch.float32))
 
     def forward(self, x: Tensor) -> Tensor:
         g = torch.sigmoid(self.gate.to(dtype=x.dtype))[None, None, :]
@@ -791,7 +798,7 @@ class SmearGate(nn.Module):
 
 class BigramHashEmbedding(nn.Module):
     """Hash consecutive token pairs into a learned embedding table."""
-    def __init__(self, bigram_vocab_size: int, bigram_dim: int, model_dim: int):
+    def __init__(self, bigram_vocab_size: int, bigram_dim: int, model_dim: int, scale_init: float):
         super().__init__()
         self.bigram_vocab_size = bigram_vocab_size
         self.embed = nn.Embedding(bigram_vocab_size, bigram_dim)
@@ -799,7 +806,7 @@ class BigramHashEmbedding(nn.Module):
         self.proj = CastedLinear(bigram_dim, model_dim, bias=False) if bigram_dim != model_dim else None
         if self.proj is not None:
             nn.init.zeros_(self.proj.weight)
-        self.scale = nn.Parameter(torch.tensor(0.05, dtype=torch.float32))
+        self.scale = nn.Parameter(torch.tensor(scale_init, dtype=torch.float32))
 
     def bigram_hash(self, tokens: Tensor) -> Tensor:
         t = tokens.to(torch.int32)
@@ -825,6 +832,10 @@ class Block(nn.Module):
         mlp_mult: float,
         mlp_kind: str,
         swiglu_hidden_mult: float,
+        attn_scale_init: float,
+        mlp_scale_init: float,
+        resid_mix_x_init: float,
+        resid_mix_x0_init: float,
         rope_base: float,
         qk_gain_init: float,
         attn_qk_softcap: float,
@@ -835,9 +846,12 @@ class Block(nn.Module):
         self.mlp_norm = RMSNorm()
         self.attn = CausalSelfAttention(dim, num_heads, num_kv_heads, rope_base, qk_gain_init, attn_qk_softcap, attn_backend)
         self.mlp = MLP(dim, mlp_mult, mlp_kind, swiglu_hidden_mult)
-        self.attn_scale = nn.Parameter(torch.ones(dim, dtype=torch.float32))
-        self.mlp_scale = nn.Parameter(torch.ones(dim, dtype=torch.float32))
-        self.resid_mix = nn.Parameter(torch.stack((torch.ones(dim), torch.zeros(dim))).float())
+        self.attn_scale = nn.Parameter(torch.full((dim,), attn_scale_init, dtype=torch.float32))
+        self.mlp_scale = nn.Parameter(torch.full((dim,), mlp_scale_init, dtype=torch.float32))
+        self.resid_mix = nn.Parameter(torch.stack((
+            torch.full((dim,), resid_mix_x_init, dtype=torch.float32),
+            torch.full((dim,), resid_mix_x0_init, dtype=torch.float32),
+        )))
 
     def forward(self, x: Tensor, x0: Tensor) -> Tensor:
         mix = self.resid_mix.to(dtype=x.dtype)
@@ -859,6 +873,13 @@ class GPT(nn.Module):
         mlp_mult: float,
         mlp_kind: str,
         swiglu_hidden_mult: float,
+        bigram_scale_init: float,
+        smear_gate_init: float,
+        skip_weights_init: float,
+        attn_scale_init: float,
+        mlp_scale_init: float,
+        resid_mix_x_init: float,
+        resid_mix_x0_init: float,
         tie_embeddings: bool,
         tied_embed_init_std: float,
         logit_softcap: float,
@@ -876,12 +897,12 @@ class GPT(nn.Module):
         self.tied_embed_init_std = tied_embed_init_std
         self.logit_softcap = logit_softcap
         self.tok_emb = nn.Embedding(vocab_size, model_dim)
-        self.bigram = BigramHashEmbedding(bigram_vocab_size, bigram_dim, model_dim) if bigram_vocab_size > 0 else None
+        self.bigram = BigramHashEmbedding(bigram_vocab_size, bigram_dim, model_dim, bigram_scale_init) if bigram_vocab_size > 0 else None
         self.num_encoder_layers = num_layers // 2
         self.num_decoder_layers = num_layers - self.num_encoder_layers
         self.num_skip_weights = min(self.num_encoder_layers, self.num_decoder_layers)
-        self.skip_weights = nn.Parameter(torch.ones(self.num_skip_weights, model_dim, dtype=torch.float32))
-        self.smear = SmearGate(model_dim)
+        self.skip_weights = nn.Parameter(torch.full((self.num_skip_weights, model_dim), skip_weights_init, dtype=torch.float32))
+        self.smear = SmearGate(model_dim, smear_gate_init)
         self.blocks = nn.ModuleList(
             [
                 Block(
@@ -891,6 +912,10 @@ class GPT(nn.Module):
                     mlp_mult,
                     mlp_kind,
                     swiglu_hidden_mult,
+                    attn_scale_init,
+                    mlp_scale_init,
+                    resid_mix_x_init,
+                    resid_mix_x0_init,
                     rope_base,
                     qk_gain_init,
                     attn_qk_softcap,
@@ -1264,6 +1289,13 @@ def main() -> None:
         mlp_mult=args.mlp_mult,
         mlp_kind=args.mlp_kind,
         swiglu_hidden_mult=args.swiglu_hidden_mult,
+        bigram_scale_init=args.bigram_scale_init,
+        smear_gate_init=args.smear_gate_init,
+        skip_weights_init=args.skip_weights_init,
+        attn_scale_init=args.attn_scale_init,
+        mlp_scale_init=args.mlp_scale_init,
+        resid_mix_x_init=args.resid_mix_x_init,
+        resid_mix_x0_init=args.resid_mix_x0_init,
         tie_embeddings=args.tie_embeddings,
         tied_embed_init_std=args.tied_embed_init_std,
         logit_softcap=args.logit_softcap,
@@ -1378,6 +1410,16 @@ def main() -> None:
         f"normuon_beta2:{args.normuon_beta2} normuon_eps:{args.normuon_eps}"
     )
     log0(f"mlp_kind:{args.mlp_kind} swiglu_hidden_mult:{args.swiglu_hidden_mult}")
+    log0(
+        "control_inits:"
+        f" bigram_scale={args.bigram_scale_init}"
+        f" smear_gate={args.smear_gate_init}"
+        f" skip_weights={args.skip_weights_init}"
+        f" attn_scale={args.attn_scale_init}"
+        f" mlp_scale={args.mlp_scale_init}"
+        f" resid_mix_x={args.resid_mix_x_init}"
+        f" resid_mix_x0={args.resid_mix_x0_init}"
+    )
     log0(f"attention_mode:gqa num_heads:{args.num_heads} num_kv_heads:{args.num_kv_heads}")
     log0(
         f"tie_embeddings:{args.tie_embeddings} embed_lr:{token_lr} "

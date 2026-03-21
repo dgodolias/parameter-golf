@@ -84,6 +84,20 @@ The `swiglu` branch uses an approximately iso-parameter hidden width by default:
 
 This keeps the branch close to the current byte budget while giving it a real architectural identity beyond tuning.
 
+### Step-10 tournament knobs
+
+The record now also supports a compile-safe screening layer on top of the control:
+
+- `BIGRAM_SCALE_INIT`
+- `SMEAR_GATE_INIT`
+- `SKIP_WEIGHTS_INIT`
+- `ATTN_SCALE_INIT`
+- `MLP_SCALE_INIT`
+- `RESID_MIX_X_INIT`
+- `RESID_MIX_X0_INIT`
+
+These are intended for `step:10` filtering only. They are not assumed winners until they survive a `step:250` replay.
+
 ## Environment Discipline
 
 Keep these scoreboards separate:
@@ -125,6 +139,14 @@ Experimental branches:
 - `.env.cloud1gpu_normuon_2048_524288`
 - `.env.cloud1gpu_fa3_normuon_2048_524288`
 - `.env.cloud1gpu_swiglu_2048_524288`
+- `.env.cloud1gpu_step10_rezero_soft_2048_524288`
+- `.env.cloud1gpu_step10_rezero_hard_2048_524288`
+- `.env.cloud1gpu_step10_deepnorm_lite_2048_524288`
+- `.env.cloud1gpu_step10_residmix_x0_2048_524288`
+- `.env.cloud1gpu_step10_smearlite_2048_524288`
+- `.env.cloud1gpu_step10_bigramscale_2048_524288`
+- `.env.cloud1gpu_step10_skiplite_2048_524288`
+- `.env.cloud1gpu_step10_swiglu_resoft_2048_524288`
 
 Historical references kept for diagnosis only:
 
@@ -176,6 +198,12 @@ export LOG_FIRST_N_STEPS=20
 export LOG_OPTIMIZER_STEP_MS=1
 export LOG_STARTUP_TIMES=1
 export LOG_PHASE_TIMINGS=0
+```
+
+Tournament helper:
+
+```bash
+bash records/track_10min_16mb/2026-03-20_10L_Int5MLP_MuonWD04_SWA50/run_step10_tournament.sh
 ```
 
 Training command:
