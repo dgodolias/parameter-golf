@@ -892,10 +892,17 @@ def main() -> None:
     torch.backends.cuda.matmul.allow_tf32 = True
     torch.backends.cudnn.allow_tf32 = True
     from torch.backends.cuda import enable_cudnn_sdp, enable_flash_sdp, enable_math_sdp, enable_mem_efficient_sdp
-    enable_cudnn_sdp(False)
-    enable_flash_sdp(True)
-    enable_mem_efficient_sdp(False)
-    enable_math_sdp(False)
+    sdp_cudnn = bool(int(os.environ.get("ENABLE_CUDNN_SDP", "0")))
+    sdp_flash = bool(int(os.environ.get("ENABLE_FLASH_SDP", "1")))
+    sdp_mem_efficient = bool(int(os.environ.get("ENABLE_MEM_EFFICIENT_SDP", "0")))
+    sdp_math = bool(int(os.environ.get("ENABLE_MATH_SDP", "0")))
+    if torch.cuda.get_device_capability(device)[0] < 9 and not sdp_math:
+        sdp_flash = False
+        sdp_math = True
+    enable_cudnn_sdp(sdp_cudnn)
+    enable_flash_sdp(sdp_flash)
+    enable_mem_efficient_sdp(sdp_mem_efficient)
+    enable_math_sdp(sdp_math)
 
     logfile = None
     if master_process:
@@ -1028,6 +1035,7 @@ def main() -> None:
     n_params = sum(p.numel() for p in base_model.parameters())
     log0(f"model_params:{n_params}")
     log0(f"world_size:{world_size} grad_accum_steps:{grad_accum_steps}")
+    log0(f"sdp_backends:cudnn={sdp_cudnn} flash={sdp_flash} mem_efficient={sdp_mem_efficient} math={sdp_math}")
     log0(f"attention_mode:gqa num_heads:{args.num_heads} num_kv_heads:{args.num_kv_heads}")
     log0(
         f"tie_embeddings:{args.tie_embeddings} embed_lr:{token_lr} "

@@ -57,6 +57,28 @@ export LOG_STARTUP_TIMES=1
 export LOG_PHASE_TIMINGS=0
 ```
 
+## Local Timing Baseline On This Branch
+
+First local smoke on RTX 4050-class setup (`seq_len=1024`, `60` iters, `MAX_VAL_SEQS=64`) with the raw upstream defaults:
+
+- `WARMUP_STEPS=20`
+- `VAL_LOSS_EVERY=60`
+- final exact: `val_loss 5.73303789`, `val_bpb 3.39322023`
+- training time at step 60: `56519ms`
+- warmup alone cost: `24673ms`
+
+Compile-safe aggressive variant:
+
+- `WARMUP_STEPS=0`
+- `VAL_LOSS_EVERY=0`
+- same final exact: `val_loss 5.73303789`, `val_bpb 3.39322023`
+- training time at step 60: `36932ms`
+
+Interpretation:
+
+- On this local proxy, removing warmup and the step-0 validation preserved score while cutting measured training time by about **34.7%**.
+- This does **not** prove the final cloud score is unchanged, but it is the right kind of time-to-quality move for the active upstream family.
+
 ## 3-Seed Results
 
 | Seed | val_bpb | artifact_bytes | valid |
