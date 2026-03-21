@@ -1100,6 +1100,7 @@ def main() -> None:
         logit_softcap=args.logit_softcap,
         rope_base=args.rope_base,
         qk_gain_init=args.qk_gain_init,
+        attn_qk_softcap=args.attn_qk_softcap,
         bigram_vocab_size=args.bigram_vocab_size,
         bigram_dim=args.bigram_dim,
     )
