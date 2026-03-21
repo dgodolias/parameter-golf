@@ -212,6 +212,12 @@ Combo tournament helper:
 bash records/track_10min_16mb/2026-03-20_10L_Int5MLP_MuonWD04_SWA50/run_step10_combo_tournament.sh
 ```
 
+FA3 runtime matrix:
+
+```bash
+bash records/track_10min_16mb/2026-03-20_10L_Int5MLP_MuonWD04_SWA50/run_fa3_install_matrix.sh
+```
+
 Focused `skiplite` sweep:
 
 ```bash
