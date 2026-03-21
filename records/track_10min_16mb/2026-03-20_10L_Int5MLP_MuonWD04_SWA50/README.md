@@ -206,6 +206,19 @@ Tournament helper:
 bash records/track_10min_16mb/2026-03-20_10L_Int5MLP_MuonWD04_SWA50/run_step10_tournament.sh
 ```
 
+Focused `skiplite` sweep:
+
+```bash
+bash records/track_10min_16mb/2026-03-20_10L_Int5MLP_MuonWD04_SWA50/run_step10_skiplite_sweep.sh
+```
+
+Optional custom grid:
+
+```bash
+SKIP_VALUES="0.82 0.88 0.92 0.98 1.02" \
+  bash records/track_10min_16mb/2026-03-20_10L_Int5MLP_MuonWD04_SWA50/run_step10_skiplite_sweep.sh
+```
+
 Training command:
 
 ```bash
