@@ -734,14 +734,15 @@ class GPT(nn.Module):
         self._init_weights()
 
     def configure_late_layer_ramp(self, *, enabled: bool, late_layers: int, init: float) -> None:
+        device = self.skip_weights.device
         self.late_layer_ramp_enabled = enabled and late_layers > 0
         if not self.late_layer_ramp_enabled:
             self.late_layer_ramp_start_idx = len(self.blocks)
-            self.late_layer_ramp_logits = nn.Parameter(torch.empty(0, dtype=torch.float32))
+            self.late_layer_ramp_logits = nn.Parameter(torch.empty(0, dtype=torch.float32, device=device))
             return
         late_layers = min(max(1, late_layers), len(self.blocks))
         self.late_layer_ramp_start_idx = len(self.blocks) - late_layers
-        self.late_layer_ramp_logits = nn.Parameter(torch.full((late_layers,), init, dtype=torch.float32))
+        self.late_layer_ramp_logits = nn.Parameter(torch.full((late_layers,), init, dtype=torch.float32, device=device))
 
     def configure_staged_depth(
         self,
