@@ -206,6 +206,12 @@ Tournament helper:
 bash records/track_10min_16mb/2026-03-20_10L_Int5MLP_MuonWD04_SWA50/run_step10_tournament.sh
 ```
 
+Combo tournament helper:
+
+```bash
+bash records/track_10min_16mb/2026-03-20_10L_Int5MLP_MuonWD04_SWA50/run_step10_combo_tournament.sh
+```
+
 Focused `skiplite` sweep:
 
 ```bash
