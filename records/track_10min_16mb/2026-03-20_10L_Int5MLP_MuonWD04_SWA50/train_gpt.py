@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import copy
 import glob
+import inspect
 import io
 import math
 import os
@@ -33,6 +34,31 @@ import torch.nn.functional as F
 from torch import Tensor, nn
 from torch.nn.parallel import DistributedDataParallel as DDP
 
+
+def _load_dotenv() -> None:
+    for path in (".env", os.path.join(os.path.dirname(__file__), ".env")):
+        if not os.path.exists(path):
+            continue
+        with open(path, "r", encoding="utf-8") as f:
+            for raw_line in f:
+                line = raw_line.strip()
+                if not line or line.startswith("#") or "=" not in line:
+                    continue
+                key, _, val = line.partition("=")
+                key = key.strip()
+                val = val.strip().strip("\"'")
+                if key and key not in os.environ:
+                    os.environ[key] = val
+        break
+
+
+_load_dotenv()
+
+try:
+    _SDPA_SUPPORTS_GQA = "enable_gqa" in inspect.signature(F.scaled_dot_product_attention).parameters
+except (TypeError, ValueError):
+    _SDPA_SUPPORTS_GQA = False
+
 # -----------------------------
 # HYPERPARAMETERS
 # -----------------------------
@@ -43,11 +69,16 @@ class Hyperparameters:
     val_files = os.path.join(data_path, "fineweb_val_*.bin")
     tokenizer_path = os.environ.get("TOKENIZER_PATH", "./data/tokenizers/fineweb_1024_bpe.model")
     run_id = os.environ.get("RUN_ID", str(uuid.uuid4()))
+    log_file = os.environ.get("LOG_FILE", "")
     seed = int(os.environ.get("SEED", 42))
 
     val_batch_size = int(os.environ.get("VAL_BATCH_SIZE", 524_288))
     val_loss_every = int(os.environ.get("VAL_LOSS_EVERY", 500))
     train_log_every = int(os.environ.get("TRAIN_LOG_EVERY", 100))
+    log_first_n_steps = int(os.environ.get("LOG_FIRST_N_STEPS", 0))
+    log_optimizer_step_ms = bool(int(os.environ.get("LOG_OPTIMIZER_STEP_MS", "0")))
+    log_startup_times = bool(int(os.environ.get("LOG_STARTUP_TIMES", "0")))
+    log_phase_timings = bool(int(os.environ.get("LOG_PHASE_TIMINGS", "0")))
 
     iterations = int(os.environ.get("ITERATIONS", 20000))
     warmdown_iters = int(os.environ.get("WARMDOWN_ITERS", 3000))
@@ -85,6 +116,7 @@ class Hyperparameters:
 
     eval_stride = int(os.environ.get("EVAL_STRIDE", 64))
     eval_batch_seqs = int(os.environ.get("EVAL_BATCH_SEQS", 32))
+    max_val_seqs = int(os.environ.get("MAX_VAL_SEQS", 0))
 
     bigram_vocab_size = int(os.environ.get("BIGRAM_VOCAB_SIZE", 10240))
     bigram_dim = int(os.environ.get("BIGRAM_DIM", 128))
@@ -235,11 +267,13 @@ def eval_val(
     total_seqs = (val_tokens.numel() - 1) // args.train_seq_len
     seq_start = (total_seqs * rank) // world_size
     seq_end = (total_seqs * (rank + 1)) // world_size
+    max_val_seqs = args.max_val_seqs if args.max_val_seqs > 0 else (seq_end - seq_start)
+    seq_end = min(seq_end, seq_start + max_val_seqs)
     val_loss_sum = torch.zeros((), device=device, dtype=torch.float64)
     val_token_count = torch.zeros((), device=device, dtype=torch.float64)
     val_byte_count = torch.zeros((), device=device, dtype=torch.float64)
     model.eval()
-    with torch.inference_mode():
+    with torch.no_grad():
         for batch_seq_start in range(seq_start, seq_end, local_batch_seqs):
             batch_seq_end = min(batch_seq_start + local_batch_seqs, seq_end)
             raw_start = batch_seq_start * args.train_seq_len
@@ -551,10 +585,17 @@ class CausalSelfAttention(nn.Module):
         q = apply_rotary_emb(q, cos, sin)
         k = apply_rotary_emb(k, cos, sin)
         q = q * self.q_gain.to(dtype=q.dtype)[None, :, None, None]
-        y = F.scaled_dot_product_attention(
-            q, k, v, attn_mask=None, is_causal=True,
-            enable_gqa=(self.num_kv_heads != self.num_heads),
-        )
+        if _SDPA_SUPPORTS_GQA:
+            y = F.scaled_dot_product_attention(
+                q, k, v, attn_mask=None, is_causal=True,
+                enable_gqa=(self.num_kv_heads != self.num_heads),
+            )
+        else:
+            if self.num_kv_heads != self.num_heads:
+                repeat_factor = self.num_heads // self.num_kv_heads
+                k = k.repeat_interleave(repeat_factor, dim=1)
+                v = v.repeat_interleave(repeat_factor, dim=1)
+            y = F.scaled_dot_product_attention(q, k, v, attn_mask=None, is_causal=True)
         y = y.transpose(1, 2).contiguous().reshape(bsz, seqlen, dim)
         return self.proj(y)
 
@@ -751,6 +792,8 @@ def eval_val_sliding(
 ) -> tuple[float, float]:
     seq_len = args.train_seq_len
     total_tokens = val_tokens.numel() - 1
+    if args.max_val_seqs > 0:
+        total_tokens = min(total_tokens, args.max_val_seqs * seq_len)
     window_starts = [ws for ws in range(0, total_tokens, stride)
                      if min(ws + seq_len, total_tokens) - ws >= stride or ws == 0]
     total_windows = len(window_starts)
@@ -763,7 +806,7 @@ def eval_val_sliding(
     byte_count = torch.zeros((), device=device, dtype=torch.float64)
 
     base_model.eval()
-    with torch.inference_mode():
+    with torch.no_grad():
         for bi in range(0, len(my_windows), batch_seqs):
             batch_ws = my_windows[bi:bi + batch_seqs]
             bsz = len(batch_ws)
@@ -856,8 +899,11 @@ def main() -> None:
 
     logfile = None
     if master_process:
-        os.makedirs("logs", exist_ok=True)
-        logfile = f"logs/{args.run_id}.txt"
+        if args.log_file:
+            logfile = args.log_file
+        else:
+            os.makedirs("logs", exist_ok=True)
+            logfile = f"logs/{args.run_id}.txt"
         print(logfile)
 
     def log0(msg: str, console: bool = True) -> None:
@@ -1014,11 +1060,21 @@ def main() -> None:
         remaining_ms = max(max_wallclock_ms - elapsed_ms, 0.0)
         return remaining_ms / max(warmdown_ms, 1e-9) if remaining_ms <= warmdown_ms else 1.0
 
+    process_start_time = time.perf_counter()
+    startup_first_warmup_logged = False
+    warmup_start_time: float | None = None
+    warmup_end_time: float | None = None
     if args.warmup_steps > 0:
         initial_model_state = {name: tensor.detach().cpu().clone() for name, tensor in base_model.state_dict().items()}
         initial_optimizer_states = [copy.deepcopy(opt.state_dict()) for opt in optimizers]
         model.train()
+        warmup_start_time = time.perf_counter()
         for warmup_step in range(args.warmup_steps):
+            if args.log_startup_times and not startup_first_warmup_logged:
+                log0(
+                    f"startup_timing:process_to_first_warmup_ms:{1000.0 * (time.perf_counter() - process_start_time):.0f}"
+                )
+                startup_first_warmup_logged = True
             zero_grad_all()
             for micro_step in range(grad_accum_steps):
                 if distributed:
@@ -1032,6 +1088,9 @@ def main() -> None:
             zero_grad_all()
             if args.warmup_steps <= 20 or (warmup_step + 1) % 10 == 0 or warmup_step + 1 == args.warmup_steps:
                 log0(f"warmup_step:{warmup_step + 1}/{args.warmup_steps}")
+        warmup_end_time = time.perf_counter()
+        if args.log_startup_times and warmup_start_time is not None:
+            log0(f"startup_timing:warmup_total_ms:{1000.0 * (warmup_end_time - warmup_start_time):.0f}")
         base_model.load_state_dict(initial_model_state, strict=True)
         for opt, state in zip(optimizers, initial_optimizer_states, strict=True):
             opt.load_state_dict(state)
@@ -1100,12 +1159,24 @@ def main() -> None:
 
         if args.grad_clip_norm > 0:
             torch.nn.utils.clip_grad_norm_(base_model.parameters(), args.grad_clip_norm)
+        optimizer_step_start: float | None = None
+        if args.log_optimizer_step_ms:
+            torch.cuda.synchronize()
+            optimizer_step_start = time.perf_counter()
         for opt in optimizers:
             opt.step()
+        optimizer_step_ms = 0.0
+        if optimizer_step_start is not None:
+            torch.cuda.synchronize()
+            optimizer_step_ms = 1000.0 * (time.perf_counter() - optimizer_step_start)
         zero_grad_all()
 
         step += 1
         approx_training_time_ms = training_time_ms + 1000.0 * (time.perf_counter() - t0)
+        if step == 1 and args.log_startup_times:
+            startup_label = "startup_timing:warmup_end_to_first_train_step_ms" if warmup_end_time is not None else "startup_timing:process_to_first_train_step_ms"
+            startup_anchor = warmup_end_time if warmup_end_time is not None else process_start_time
+            log0(f"{startup_label}:{1000.0 * (time.perf_counter() - startup_anchor):.0f}")
 
         # SWA: collect checkpoints during warmdown
         if args.swa_enabled and scale < args.swa_start_frac and step % args.swa_every == 0:
@@ -1122,11 +1193,22 @@ def main() -> None:
             args.train_log_every > 0
             and (step <= 10 or step % args.train_log_every == 0 or stop_after_step is not None)
         )
+        if args.log_first_n_steps > 0 and step <= args.log_first_n_steps:
+            msg = (
+                f"step_timing:{step}/{args.iterations} step_ms:{approx_training_time_ms / step:.2f} "
+                f"train_time:{approx_training_time_ms:.0f}ms"
+            )
+            if args.log_optimizer_step_ms:
+                msg += f" optimizer_step_ms:{optimizer_step_ms:.2f}"
+            log0(msg)
         if should_log_train:
-            log0(
+            msg = (
                 f"step:{step}/{args.iterations} train_loss:{train_loss.item():.4f} "
                 f"train_time:{approx_training_time_ms:.0f}ms step_avg:{approx_training_time_ms / step:.2f}ms"
             )
+            if args.log_optimizer_step_ms:
+                msg += f" optimizer_step_ms:{optimizer_step_ms:.2f}"
+            log0(msg)
 
         reached_cap = max_wallclock_ms is not None and approx_training_time_ms >= max_wallclock_ms
         if distributed and max_wallclock_ms is not None:

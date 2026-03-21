@@ -17,6 +17,46 @@ SEED=42 bash eval/eval.sh
 
 All parameters are set as defaults in `train_gpt.py`. No env vars needed.
 
+## Local / Cloud Workflow
+
+This integration branch adds researcher conveniences without changing the default baseline when env vars are unset:
+
+- `.env` loading from this record folder
+- `MAX_VAL_SEQS` support for capped local validation and final sliding eval
+- env-gated timing logs:
+  - `LOG_FIRST_N_STEPS`
+  - `LOG_OPTIMIZER_STEP_MS`
+  - `LOG_STARTUP_TIMES`
+  - `LOG_PHASE_TIMINGS`
+- safe fallback for older PyTorch builds that do not support `enable_gqa` in `scaled_dot_product_attention`
+- eval cache safety using `torch.no_grad()` instead of `torch.inference_mode()` where cached RoPE tensors are created
+
+For local smoke runs:
+
+```powershell
+Copy-Item records\track_10min_16mb\2026-03-20_10L_Int5MLP_MuonWD04_SWA50\.env.local `
+  records\track_10min_16mb\2026-03-20_10L_Int5MLP_MuonWD04_SWA50\.env -Force
+python records/track_10min_16mb/2026-03-20_10L_Int5MLP_MuonWD04_SWA50/train_gpt.py
+```
+
+For cloud / official-like runs:
+
+```bash
+cp records/track_10min_16mb/2026-03-20_10L_Int5MLP_MuonWD04_SWA50/.env.production \
+   records/track_10min_16mb/2026-03-20_10L_Int5MLP_MuonWD04_SWA50/.env
+torchrun --standalone --nproc_per_node=8 \
+  records/track_10min_16mb/2026-03-20_10L_Int5MLP_MuonWD04_SWA50/train_gpt.py
+```
+
+For 1xH100 preflights, enable timing logs:
+
+```bash
+export LOG_FIRST_N_STEPS=20
+export LOG_OPTIMIZER_STEP_MS=1
+export LOG_STARTUP_TIMES=1
+export LOG_PHASE_TIMINGS=0
+```
+
 ## 3-Seed Results
 
 | Seed | val_bpb | artifact_bytes | valid |
