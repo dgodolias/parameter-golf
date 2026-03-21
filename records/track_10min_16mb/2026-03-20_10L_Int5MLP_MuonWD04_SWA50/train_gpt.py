@@ -759,12 +759,11 @@ class GPT(nn.Module):
 
     @staticmethod
     def _apply_block_with_alpha(block: nn.Module, x: Tensor, x0: Tensor, alpha: float) -> Tensor:
-        if alpha <= 0.0:
-            return x
         if alpha >= 1.0:
             return block(x, x0)
         block_out = block(x, x0)
-        return x + (block_out - x) * alpha
+        alpha_t = x.new_tensor(alpha)
+        return x + (block_out - x) * alpha_t
 
     def _init_weights(self) -> None:
         if self.tie_embeddings:
