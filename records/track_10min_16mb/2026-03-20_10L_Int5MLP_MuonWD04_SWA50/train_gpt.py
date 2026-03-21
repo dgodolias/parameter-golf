@@ -1078,7 +1078,7 @@ def main() -> None:
         qk_gain_init=args.qk_gain_init,
         bigram_vocab_size=args.bigram_vocab_size,
         bigram_dim=args.bigram_dim,
-    ).to(device).bfloat16()
+    )
     staged_depth_switch_step = int(args.iterations * args.staged_depth_switch_frac)
     base_model.configure_staged_depth(
         enabled=args.staged_depth_enabled,
@@ -1091,6 +1091,7 @@ def main() -> None:
         late_layers=args.late_layer_ramp_layers,
         init=args.late_layer_ramp_init,
     )
+    base_model = base_model.to(device).bfloat16()
     for module in base_model.modules():
         if isinstance(module, CastedLinear):
             module.float()
