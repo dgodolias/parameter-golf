@@ -789,21 +789,15 @@ class GPT(nn.Module):
         x0 = x
         skips: list[Tensor] = []
         active_encoder_layers, active_decoder_layers, ramp_alpha = self._staged_depth_state()
-        for i in range(active_encoder_layers):
-            x = self.blocks[i](x, x0)
+        for i in range(self.num_encoder_layers):
+            alpha = 1.0 if i < active_encoder_layers else ramp_alpha
+            x = self._apply_block_with_alpha(self.blocks[i], x, x0, alpha)
             skips.append(x)
-        for i in range(active_decoder_layers):
+        for i in range(self.num_decoder_layers):
             if skips:
                 x = x + self.skip_weights[i].to(dtype=x.dtype)[None, None, :] * skips.pop()
-            x = self.blocks[self.num_encoder_layers + i](x, x0)
-        for i in range(active_encoder_layers, self.num_encoder_layers):
-            x = self._apply_block_with_alpha(self.blocks[i], x, x0, ramp_alpha)
-            if ramp_alpha > 0.0:
-                skips.append(x)
-        for i in range(active_decoder_layers, self.num_decoder_layers):
-            if skips:
-                x = x + self.skip_weights[i].to(dtype=x.dtype)[None, None, :] * skips.pop()
-            x = self._apply_block_with_alpha(self.blocks[self.num_encoder_layers + i], x, x0, ramp_alpha)
+            alpha = 1.0 if i < active_decoder_layers else ramp_alpha
+            x = self._apply_block_with_alpha(self.blocks[self.num_encoder_layers + i], x, x0, alpha)
         x = self.final_norm(x).reshape(-1, x.size(-1))
         targets = target_ids.reshape(-1)
         if self.tie_embeddings:
@@ -824,21 +818,15 @@ class GPT(nn.Module):
         x0 = x
         skips: list[Tensor] = []
         active_encoder_layers, active_decoder_layers, ramp_alpha = self._staged_depth_state()
-        for i in range(active_encoder_layers):
-            x = self.blocks[i](x, x0)
+        for i in range(self.num_encoder_layers):
+            alpha = 1.0 if i < active_encoder_layers else ramp_alpha
+            x = self._apply_block_with_alpha(self.blocks[i], x, x0, alpha)
             skips.append(x)
-        for i in range(active_decoder_layers):
+        for i in range(self.num_decoder_layers):
             if skips:
                 x = x + self.skip_weights[i].to(dtype=x.dtype)[None, None, :] * skips.pop()
-            x = self.blocks[self.num_encoder_layers + i](x, x0)
-        for i in range(active_encoder_layers, self.num_encoder_layers):
-            x = self._apply_block_with_alpha(self.blocks[i], x, x0, ramp_alpha)
-            if ramp_alpha > 0.0:
-                skips.append(x)
-        for i in range(active_decoder_layers, self.num_decoder_layers):
-            if skips:
-                x = x + self.skip_weights[i].to(dtype=x.dtype)[None, None, :] * skips.pop()
-            x = self._apply_block_with_alpha(self.blocks[self.num_encoder_layers + i], x, x0, ramp_alpha)
+            alpha = 1.0 if i < active_decoder_layers else ramp_alpha
+            x = self._apply_block_with_alpha(self.blocks[self.num_encoder_layers + i], x, x0, alpha)
         x = self.final_norm(x)
         if self.tie_embeddings:
             logits_proj = F.linear(x, self.tok_emb.weight)
@@ -1068,16 +1056,7 @@ def main() -> None:
         )
     else:
         train_model = base_model
-    model: nn.Module = (
-        DDP(
-            train_model,
-            device_ids=[local_rank],
-            broadcast_buffers=False,
-            find_unused_parameters=args.staged_depth_enabled,
-        )
-        if distributed
-        else train_model
-    )
+    model: nn.Module = DDP(train_model, device_ids=[local_rank], broadcast_buffers=False) if distributed else train_model
 
     block_named_params = list(base_model.blocks.named_parameters())
     matrix_params = [
