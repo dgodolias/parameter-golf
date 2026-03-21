@@ -1068,7 +1068,16 @@ def main() -> None:
         )
     else:
         train_model = base_model
-    model: nn.Module = DDP(train_model, device_ids=[local_rank], broadcast_buffers=False) if distributed else train_model
+    model: nn.Module = (
+        DDP(
+            train_model,
+            device_ids=[local_rank],
+            broadcast_buffers=False,
+            find_unused_parameters=args.staged_depth_enabled,
+        )
+        if distributed
+        else train_model
+    )
 
     block_named_params = list(base_model.blocks.named_parameters())
     matrix_params = [
