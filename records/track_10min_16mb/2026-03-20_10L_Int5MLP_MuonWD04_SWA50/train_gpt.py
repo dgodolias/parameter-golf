@@ -720,6 +720,7 @@ class GPT(nn.Module):
         logit_softcap: float,
         rope_base: float,
         qk_gain_init: float,
+        attn_qk_softcap: float,
         bigram_vocab_size: int = 0,
         bigram_dim: int = 128,
     ):
