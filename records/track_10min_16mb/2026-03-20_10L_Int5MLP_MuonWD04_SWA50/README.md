@@ -141,6 +141,12 @@ Control candidate:
 - `.env.cloud8gpu_proxy_batch393216`
 - `.env.cloud8gpu_proxy_batch458752_seq1536`
 
+Heist backbone wave:
+
+- `.env.cloud1gpu_backbone_11l_xsa4_ema`
+- `.env.cloud8gpu_backbone_11l_xsa4_ema_proxy`
+- `.env.cloud8gpu_backbone_11l_xsa4_ema_production`
+
 Experimental branches:
 
 - `.env.cloud1gpu_fa3_2048_524288`

@@ -86,6 +86,9 @@ class Hyperparameters:
     compile_muon_backend = bool(int(os.environ.get("COMPILE_MUON_BACKEND", "1")))
     attn_backend = os.environ.get("ATTN_BACKEND", "flash2").strip().lower()
     optimizer_kind = os.environ.get("OPTIMIZER_KIND", "muon").strip().lower()
+    xsa_last_n = int(os.environ.get("XSA_LAST_N", 0))
+    ema_enabled = bool(int(os.environ.get("EMA_ENABLED", "0")))
+    ema_decay = float(os.environ.get("EMA_DECAY", 0.997))
 
     iterations = int(os.environ.get("ITERATIONS", 20000))
     warmdown_iters = int(os.environ.get("WARMDOWN_ITERS", 3000))
@@ -106,6 +109,8 @@ class Hyperparameters:
     swiglu_hidden_mult = float(os.environ.get("SWIGLU_HIDDEN_MULT", 0.0))
     tie_embeddings = bool(int(os.environ.get("TIE_EMBEDDINGS", "1")))
     rope_base = float(os.environ.get("ROPE_BASE", 10000.0))
+    rope_dims = int(os.environ.get("ROPE_DIMS", 0))
+    ln_scale = bool(int(os.environ.get("LN_SCALE", "0")))
     logit_softcap = float(os.environ.get("LOGIT_SOFTCAP", 30.0))
 
     embed_lr = float(os.environ.get("EMBED_LR", 0.6))
@@ -659,9 +664,16 @@ def restore_low_dim_params_to_fp32(module: nn.Module) -> None:
 
 
 class Rotary(nn.Module):
-    def __init__(self, dim: int, base: float = 10000.0):
+    def __init__(self, dim: int, base: float = 10000.0, train_seq_len: int = 1024, rope_dims: int = 0):
         super().__init__()
-        inv_freq = 1.0 / (base ** (torch.arange(0, dim, 2, dtype=torch.float32) / dim))
+        self.dim = dim
+        self.base = base
+        self.train_seq_len = train_seq_len
+        self.rope_dims = rope_dims if rope_dims > 0 else dim
+        if self.rope_dims > dim or self.rope_dims % 2 != 0:
+            raise ValueError(f"rope_dims must be even and <= dim, got rope_dims={self.rope_dims}, dim={dim}")
+        rd = self.rope_dims
+        inv_freq = 1.0 / (base ** (torch.arange(0, rd, 2, dtype=torch.float32) / rd))
         self.register_buffer("inv_freq", inv_freq, persistent=False)
         self._seq_len_cached = 0
         self._cos_cached: Tensor | None = None
@@ -674,8 +686,15 @@ class Rotary(nn.Module):
             or self._seq_len_cached != seq_len
             or self._cos_cached.device != device
         ):
-            t = torch.arange(seq_len, device=device, dtype=self.inv_freq.dtype)
-            freqs = torch.outer(t, self.inv_freq.to(device))
+            rd = self.rope_dims
+            if seq_len > self.train_seq_len:
+                scale = seq_len / self.train_seq_len
+                new_base = self.base * (scale ** (rd / (rd - 2)))
+                inv_freq = 1.0 / (new_base ** (torch.arange(0, rd, 2, dtype=torch.float32, device=device) / rd))
+            else:
+                inv_freq = self.inv_freq.to(device)
+            t = torch.arange(seq_len, device=device, dtype=inv_freq.dtype)
+            freqs = torch.outer(t, inv_freq)
             self._cos_cached = freqs.cos()[None, None, :, :]
             self._sin_cached = freqs.sin()[None, None, :, :]
             self._seq_len_cached = seq_len
@@ -683,9 +702,15 @@ class Rotary(nn.Module):
 
 
 def apply_rotary_emb(x: Tensor, cos: Tensor, sin: Tensor) -> Tensor:
-    half = x.size(-1) // 2
-    x1, x2 = x[..., :half], x[..., half:]
-    return torch.cat((x1 * cos + x2 * sin, x1 * (-sin) + x2 * cos), dim=-1)
+    rd = cos.size(-1) * 2
+    if rd < x.size(-1):
+        x_rope, x_pass = x[..., :rd], x[..., rd:]
+    else:
+        x_rope, x_pass = x, None
+    half = x_rope.size(-1) // 2
+    x1, x2 = x_rope[..., :half], x_rope[..., half:]
+    x_rot = torch.cat((x1 * cos + x2 * sin, x1 * (-sin) + x2 * cos), dim=-1)
+    return torch.cat((x_rot, x_pass), dim=-1) if x_pass is not None else x_rot
 
 
 class CausalSelfAttention(nn.Module):
@@ -698,6 +723,7 @@ class CausalSelfAttention(nn.Module):
         qk_gain_init: float,
         attn_qk_softcap: float,
         attn_backend: str,
+        rope_dims: int = 0,
     ):
         super().__init__()
         if dim % num_heads != 0:
@@ -719,7 +745,19 @@ class CausalSelfAttention(nn.Module):
         self.attn_qk_softcap = attn_qk_softcap
         self.attn_backend = attn_backend
         self.flash3_attention = get_flash3_attention() if attn_backend == "flash3" else None
-        self.rotary = Rotary(self.head_dim, base=rope_base)
+        self.rotary = Rotary(self.head_dim, base=rope_base, train_seq_len=1024, rope_dims=rope_dims)
+        self.use_xsa = False
+
+    def _xsa_efficient(self, y: Tensor, v: Tensor) -> Tensor:
+        bsz, num_heads, seqlen, head_dim = y.shape
+        num_kv_heads = v.size(1)
+        group = num_heads // num_kv_heads
+        y_t = y.transpose(1, 2).contiguous()
+        v_t = v.transpose(1, 2).contiguous()
+        y_g = y_t.reshape(bsz, seqlen, num_kv_heads, group, head_dim)
+        vn = F.normalize(v_t, dim=-1).unsqueeze(-2)
+        proj = (y_g * vn).sum(dim=-1, keepdim=True) * vn
+        return (y_g - proj).reshape(bsz, seqlen, num_heads, head_dim).transpose(1, 2).contiguous()
 
     def forward(self, x: Tensor) -> Tensor:
         bsz, seqlen, dim = x.shape
@@ -753,6 +791,8 @@ class CausalSelfAttention(nn.Module):
                 k = k.repeat_interleave(repeat_factor, dim=1)
                 v = v.repeat_interleave(repeat_factor, dim=1)
             y = F.scaled_dot_product_attention(q, k, v, attn_mask=None, is_causal=True)
+        if self.use_xsa:
+            y = self._xsa_efficient(y, v)
         y = y.transpose(1, 2).contiguous().reshape(bsz, seqlen, dim)
         return self.proj(y)
 
@@ -840,11 +880,16 @@ class Block(nn.Module):
         qk_gain_init: float,
         attn_qk_softcap: float,
         attn_backend: str,
+        rope_dims: int,
+        layer_idx: int,
+        ln_scale: bool,
     ):
         super().__init__()
         self.attn_norm = RMSNorm()
         self.mlp_norm = RMSNorm()
-        self.attn = CausalSelfAttention(dim, num_heads, num_kv_heads, rope_base, qk_gain_init, attn_qk_softcap, attn_backend)
+        self.attn = CausalSelfAttention(
+            dim, num_heads, num_kv_heads, rope_base, qk_gain_init, attn_qk_softcap, attn_backend, rope_dims=rope_dims
+        )
         self.mlp = MLP(dim, mlp_mult, mlp_kind, swiglu_hidden_mult)
         self.attn_scale = nn.Parameter(torch.full((dim,), attn_scale_init, dtype=torch.float32))
         self.mlp_scale = nn.Parameter(torch.full((dim,), mlp_scale_init, dtype=torch.float32))
@@ -852,13 +897,15 @@ class Block(nn.Module):
             torch.full((dim,), resid_mix_x_init, dtype=torch.float32),
             torch.full((dim,), resid_mix_x0_init, dtype=torch.float32),
         )))
+        self.ln_scale_factor = 1.0 / math.sqrt(layer_idx + 1) if ln_scale else 1.0
 
     def forward(self, x: Tensor, x0: Tensor) -> Tensor:
         mix = self.resid_mix.to(dtype=x.dtype)
         x = mix[0][None, None, :] * x + mix[1][None, None, :] * x0
-        attn_out = self.attn(self.attn_norm(x))
+        scale = self.ln_scale_factor
+        attn_out = self.attn(self.attn_norm(x) * scale)
         x = x + self.attn_scale.to(dtype=x.dtype)[None, None, :] * attn_out
-        x = x + self.mlp_scale.to(dtype=x.dtype)[None, None, :] * self.mlp(self.mlp_norm(x))
+        x = x + self.mlp_scale.to(dtype=x.dtype)[None, None, :] * self.mlp(self.mlp_norm(x) * scale)
         return x
 
 
@@ -887,6 +934,9 @@ class GPT(nn.Module):
         qk_gain_init: float,
         attn_qk_softcap: float,
         attn_backend: str,
+        xsa_last_n: int = 0,
+        rope_dims: int = 0,
+        ln_scale: bool = False,
         bigram_vocab_size: int = 0,
         bigram_dim: int = 128,
     ):
@@ -920,8 +970,11 @@ class GPT(nn.Module):
                     qk_gain_init,
                     attn_qk_softcap,
                     attn_backend,
+                    rope_dims,
+                    i,
+                    ln_scale,
                 )
-                for _ in range(num_layers)
+                for i in range(num_layers)
             ]
         )
         self.final_norm = RMSNorm()
@@ -936,6 +989,9 @@ class GPT(nn.Module):
         self.staged_depth_switch_step = 0
         self.staged_depth_ramp_steps = 0
         self._staged_depth_current_step = 0
+        if xsa_last_n > 0:
+            for i in range(max(0, num_layers - xsa_last_n), num_layers):
+                self.blocks[i].attn.use_xsa = True
         self._init_weights()
 
     def configure_late_layer_ramp(self, *, enabled: bool, late_layers: int, init: float) -> None:
@@ -1303,6 +1359,9 @@ def main() -> None:
         qk_gain_init=args.qk_gain_init,
         attn_qk_softcap=args.attn_qk_softcap,
         attn_backend=args.attn_backend,
+        xsa_last_n=args.xsa_last_n,
+        rope_dims=args.rope_dims,
+        ln_scale=args.ln_scale,
         bigram_vocab_size=args.bigram_vocab_size,
         bigram_dim=args.bigram_dim,
     )
@@ -1409,6 +1468,8 @@ def main() -> None:
         f"optimizer_kind:{args.optimizer_kind} muon_momentum:{args.muon_momentum} "
         f"normuon_beta2:{args.normuon_beta2} normuon_eps:{args.normuon_eps}"
     )
+    log0(f"backbone:xsa_last_n={args.xsa_last_n} rope_dims={args.rope_dims} ln_scale={args.ln_scale}")
+    log0(f"averaging:ema_enabled={args.ema_enabled} ema_decay={args.ema_decay} swa_enabled={args.swa_enabled}")
     log0(f"mlp_kind:{args.mlp_kind} swiglu_hidden_mult:{args.swiglu_hidden_mult}")
     log0(
         "control_inits:"
@@ -1506,6 +1567,9 @@ def main() -> None:
     stop_after_step: int | None = None
     swa_state: dict[str, Tensor] | None = None
     swa_count = 0
+    ema_state: dict[str, Tensor] | None = None
+    if args.ema_enabled:
+        ema_state = {name: t.detach().float().clone() for name, t in base_model.state_dict().items()}
     torch.cuda.synchronize()
     t0 = time.perf_counter()
 
@@ -1574,6 +1638,12 @@ def main() -> None:
             optimizer_step_ms = 1000.0 * (time.perf_counter() - optimizer_step_start)
         zero_grad_all()
 
+        if ema_state is not None:
+            decay = args.ema_decay
+            with torch.no_grad():
+                for name, t in base_model.state_dict().items():
+                    ema_state[name].mul_(decay).add_(t.detach().float(), alpha=1.0 - decay)
+
         step += 1
         approx_training_time_ms = training_time_ms + 1000.0 * (time.perf_counter() - t0)
         if step == 1 and args.log_startup_times:
@@ -1582,7 +1652,7 @@ def main() -> None:
             log0(f"{startup_label}:{1000.0 * (time.perf_counter() - startup_anchor):.0f}")
 
         # SWA: collect checkpoints during warmdown
-        if args.swa_enabled and scale < args.swa_start_frac and step % args.swa_every == 0:
+        if args.swa_enabled and not args.ema_enabled and scale < args.swa_start_frac and step % args.swa_every == 0:
             if swa_state is None:
                 swa_state = {name: t.detach().cpu().clone() for name, t in base_model.state_dict().items()}
                 swa_count = 1
@@ -1627,7 +1697,15 @@ def main() -> None:
     )
 
     # Apply SWA if collected
-    if args.swa_enabled and swa_state is not None and swa_count > 1:
+    if ema_state is not None:
+        log0("ema:applying EMA weights")
+        current_state = base_model.state_dict()
+        avg_state = {
+            name: tensor.to(dtype=current_state[name].dtype)
+            for name, tensor in ema_state.items()
+        }
+        base_model.load_state_dict(avg_state, strict=True)
+    elif args.swa_enabled and swa_state is not None and swa_count > 1:
         log0(f"swa:applying averaged {swa_count} checkpoints")
         current_state = base_model.state_dict()
         avg_state = {
