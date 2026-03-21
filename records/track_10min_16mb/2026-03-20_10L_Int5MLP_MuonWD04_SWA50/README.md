@@ -131,6 +131,7 @@ python -c "import zstandard"
 Control candidate:
 
 - `.env.cloud1gpu_anchor`
+- `.env.cloud8gpu_production`
 - `.env.production`
 
 Experimental branches:
@@ -218,6 +219,12 @@ FA3 runtime matrix:
 bash records/track_10min_16mb/2026-03-20_10L_Int5MLP_MuonWD04_SWA50/run_fa3_install_matrix.sh
 ```
 
+Final 8xH100 launch helper:
+
+```bash
+bash records/track_10min_16mb/2026-03-20_10L_Int5MLP_MuonWD04_SWA50/run_8gpu_production.sh
+```
+
 Focused `skiplite` sweep:
 
 ```bash
@@ -236,6 +243,12 @@ Training command:
 ```bash
 torchrun --standalone --nproc_per_node=1 \
   records/track_10min_16mb/2026-03-20_10L_Int5MLP_MuonWD04_SWA50/train_gpt.py
+```
+
+Final 8xH100 command:
+
+```bash
+bash records/track_10min_16mb/2026-03-20_10L_Int5MLP_MuonWD04_SWA50/run_8gpu_production.sh
 ```
 
 Useful summary:
