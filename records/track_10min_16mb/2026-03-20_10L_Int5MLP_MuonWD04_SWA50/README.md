@@ -62,6 +62,12 @@ export LOG_STARTUP_TIMES=1
 export LOG_PHASE_TIMINGS=0
 ```
 
+Prepared 1xH100 env templates:
+
+- `.env.cloud1gpu_anchor`
+- `.env.cloud1gpu_upstream_default`
+- `.env.cloud1gpu_geometry_1024_524288`
+
 For runtime rescue experiments on the same family:
 
 ```bash
@@ -129,6 +135,70 @@ The first active runtime track is:
 
 The active cloud default now uses Variant 4. Only after the best runtime-safe path is clear do we promote score-side experiments around WD, momentum warmup, SWA, and bigram capacity.
 
+## Environment Discipline
+
+Keep these scoreboards separate:
+
+1. `local`
+2. `cloud-1gpu-current-pod-class`
+3. `cloud-8gpu`
+
+Do not compare across them directly.
+
+Every cloud run should record:
+
+- commit hash
+- effective env / compile mode
+- whether `zstandard` is installed
+- startup timing
+- step timing
+- stop-time validation
+- final exact validation
+
+The older fast `1xH100` result should no longer be used as reference. The current pod class reproducibly runs a much slower `1xH100` regime, so all future comparisons should use the new canonical anchor below.
+
+## Canonical Cloud Anchors
+
+### 1xH100 current-pod anchor
+
+No-compile path, `zstandard` installed:
+
+- `COMPILE_MODEL=0`
+- `COMPILE_MUON_BACKEND=0`
+- `WARMUP_STEPS=0`
+- `VAL_LOSS_EVERY=0`
+- `TRAIN_SEQ_LEN=2048`
+- `TRAIN_BATCH_TOKENS=786432`
+
+Measured result:
+
+- `step:250 train_time: 595523ms`
+- `step:252 val_bpb: 1.9466`
+- `stopping_early: step 252 @ 600355ms`
+- `Total submission size int8+zstd: 15797894`
+
+Interpretation:
+
+- this is the active `cloud-1gpu` anchor to beat
+- size is valid when `zstandard` is present
+- throughput is much slower than the earlier one-off fast run, so the older run is treated as non-authoritative
+
+### First 8xH100 production shot
+
+Same no-compile path, `zstandard` installed:
+
+- training stopped at `step 1854 @ 600215ms`
+- stop-time `val_bpb: 1.2429`
+- `final_int8_zlib_roundtrip_exact val_bpb: 1.25043812`
+- `eval_time: 258517ms`
+
+Interpretation:
+
+- infrastructure path is valid
+- training cap and eval cap both work
+- score is far from competitive
+- no-compile runtime rescue alone is not enough to make this family competitive
+
 ## First Aggressive Score Wave
 
 All runs below used the runtime-safe local path:
@@ -154,6 +224,23 @@ Interpretation:
 - `WEIGHT_DECAY=0.05` is worse.
 - `MUON_MOMENTUM_WARMUP_STEPS=1000/2000` did not improve the local proxy.
 - No score-side promotion yet from this first wave; the baseline hyperparameters remain the active score reference.
+
+## Next Cheap Loop
+
+Before another expensive `8xH100` run, the next loop should be:
+
+1. Reproduce the canonical `1xH100` anchor on the current pod class.
+2. Run geometry diagnosis on `1xH100`:
+   - `TRAIN_SEQ_LEN=1024`, `TRAIN_BATCH_TOKENS=524288`
+   - `TRAIN_SEQ_LEN=1024` only
+   - `TRAIN_BATCH_TOKENS=524288` only
+3. Run one strict upstream-default comparison on `1xH100`:
+   - original compile path
+   - original warmup / production-like settings
+4. Only after that, try the first aggressive model-side idea:
+   - staged depth activation
+
+Sequence-length warmup remains out of the active cloud path unless the runtime stack changes materially.
 
 ## 3-Seed Results
 
