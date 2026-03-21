@@ -749,7 +749,7 @@ class GPT(nn.Module):
             self.lm_head._zero_init = True
         self.late_layer_ramp_enabled = False
         self.late_layer_ramp_start_idx = num_layers
-        self.late_layer_ramp_logits = nn.Parameter(torch.empty(0, dtype=torch.float32))
+        self.register_parameter("late_layer_ramp_logits", None)
         self.staged_depth_enabled = False
         self.staged_depth_early_layers = num_layers
         self.staged_depth_switch_step = 0
@@ -762,7 +762,7 @@ class GPT(nn.Module):
         self.late_layer_ramp_enabled = enabled and late_layers > 0
         if not self.late_layer_ramp_enabled:
             self.late_layer_ramp_start_idx = len(self.blocks)
-            self.late_layer_ramp_logits = nn.Parameter(torch.empty(0, dtype=torch.float32, device=device))
+            self.late_layer_ramp_logits = None
             return
         late_layers = min(max(1, late_layers), len(self.blocks))
         self.late_layer_ramp_start_idx = len(self.blocks) - late_layers
