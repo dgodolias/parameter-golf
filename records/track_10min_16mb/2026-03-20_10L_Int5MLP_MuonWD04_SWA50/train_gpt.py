@@ -128,6 +128,10 @@ class Hyperparameters:
     swa_enabled = bool(int(os.environ.get("SWA_ENABLED", "1")))
     swa_start_frac = float(os.environ.get("SWA_START_FRAC", 0.4))
     swa_every = int(os.environ.get("SWA_EVERY", 50))
+    staged_depth_enabled = bool(int(os.environ.get("STAGED_DEPTH_ENABLED", "0")))
+    staged_depth_early_layers = int(os.environ.get("STAGED_DEPTH_EARLY_LAYERS", 8))
+    staged_depth_switch_frac = float(os.environ.get("STAGED_DEPTH_SWITCH_FRAC", 0.15))
+    staged_depth_ramp_steps = int(os.environ.get("STAGED_DEPTH_RAMP_STEPS", 200))
 
 # -----------------------------
 # MUON OPTIMIZER
@@ -716,7 +720,51 @@ class GPT(nn.Module):
         self.lm_head = None if tie_embeddings else CastedLinear(model_dim, vocab_size, bias=False)
         if self.lm_head is not None:
             self.lm_head._zero_init = True
+        self.staged_depth_enabled = False
+        self.staged_depth_early_layers = num_layers
+        self.staged_depth_switch_step = 0
+        self.staged_depth_ramp_steps = 0
+        self._staged_depth_current_step = 0
         self._init_weights()
+
+    def configure_staged_depth(
+        self,
+        *,
+        enabled: bool,
+        early_layers: int,
+        switch_step: int,
+        ramp_steps: int,
+    ) -> None:
+        self.staged_depth_enabled = enabled
+        self.staged_depth_early_layers = max(1, min(early_layers, len(self.blocks)))
+        self.staged_depth_switch_step = max(0, switch_step)
+        self.staged_depth_ramp_steps = max(0, ramp_steps)
+
+    def set_staged_depth_step(self, step: int) -> None:
+        self._staged_depth_current_step = max(0, step)
+
+    def _staged_depth_state(self) -> tuple[int, int, float]:
+        if not self.staged_depth_enabled:
+            return self.num_encoder_layers, self.num_decoder_layers, 1.0
+        early_total = self.staged_depth_early_layers
+        early_encoder = min(self.num_encoder_layers, early_total // 2)
+        early_decoder = min(self.num_decoder_layers, early_total - early_encoder)
+        if self._staged_depth_current_step < self.staged_depth_switch_step:
+            return early_encoder, early_decoder, 0.0
+        if self.staged_depth_ramp_steps <= 0:
+            return self.num_encoder_layers, self.num_decoder_layers, 1.0
+        ramp_progress = (self._staged_depth_current_step - self.staged_depth_switch_step) / self.staged_depth_ramp_steps
+        ramp_alpha = min(max(ramp_progress, 0.0), 1.0)
+        return early_encoder, early_decoder, ramp_alpha
+
+    @staticmethod
+    def _apply_block_with_alpha(block: nn.Module, x: Tensor, x0: Tensor, alpha: float) -> Tensor:
+        if alpha <= 0.0:
+            return x
+        if alpha >= 1.0:
+            return block(x, x0)
+        block_out = block(x, x0)
+        return x + (block_out - x) * alpha
 
     def _init_weights(self) -> None:
         if self.tie_embeddings:
@@ -740,13 +788,22 @@ class GPT(nn.Module):
         x = self.smear(x)
         x0 = x
         skips: list[Tensor] = []
-        for i in range(self.num_encoder_layers):
+        active_encoder_layers, active_decoder_layers, ramp_alpha = self._staged_depth_state()
+        for i in range(active_encoder_layers):
             x = self.blocks[i](x, x0)
             skips.append(x)
-        for i in range(self.num_decoder_layers):
+        for i in range(active_decoder_layers):
             if skips:
                 x = x + self.skip_weights[i].to(dtype=x.dtype)[None, None, :] * skips.pop()
             x = self.blocks[self.num_encoder_layers + i](x, x0)
+        for i in range(active_encoder_layers, self.num_encoder_layers):
+            x = self._apply_block_with_alpha(self.blocks[i], x, x0, ramp_alpha)
+            if ramp_alpha > 0.0:
+                skips.append(x)
+        for i in range(active_decoder_layers, self.num_decoder_layers):
+            if skips:
+                x = x + self.skip_weights[i].to(dtype=x.dtype)[None, None, :] * skips.pop()
+            x = self._apply_block_with_alpha(self.blocks[self.num_encoder_layers + i], x, x0, ramp_alpha)
         x = self.final_norm(x).reshape(-1, x.size(-1))
         targets = target_ids.reshape(-1)
         if self.tie_embeddings:
@@ -766,13 +823,22 @@ class GPT(nn.Module):
         x = self.smear(x)
         x0 = x
         skips: list[Tensor] = []
-        for i in range(self.num_encoder_layers):
+        active_encoder_layers, active_decoder_layers, ramp_alpha = self._staged_depth_state()
+        for i in range(active_encoder_layers):
             x = self.blocks[i](x, x0)
             skips.append(x)
-        for i in range(self.num_decoder_layers):
+        for i in range(active_decoder_layers):
             if skips:
                 x = x + self.skip_weights[i].to(dtype=x.dtype)[None, None, :] * skips.pop()
             x = self.blocks[self.num_encoder_layers + i](x, x0)
+        for i in range(active_encoder_layers, self.num_encoder_layers):
+            x = self._apply_block_with_alpha(self.blocks[i], x, x0, ramp_alpha)
+            if ramp_alpha > 0.0:
+                skips.append(x)
+        for i in range(active_decoder_layers, self.num_decoder_layers):
+            if skips:
+                x = x + self.skip_weights[i].to(dtype=x.dtype)[None, None, :] * skips.pop()
+            x = self._apply_block_with_alpha(self.blocks[self.num_encoder_layers + i], x, x0, ramp_alpha)
         x = self.final_norm(x)
         if self.tie_embeddings:
             logits_proj = F.linear(x, self.tok_emb.weight)
@@ -983,6 +1049,13 @@ def main() -> None:
         bigram_vocab_size=args.bigram_vocab_size,
         bigram_dim=args.bigram_dim,
     ).to(device).bfloat16()
+    staged_depth_switch_step = int(args.iterations * args.staged_depth_switch_frac)
+    base_model.configure_staged_depth(
+        enabled=args.staged_depth_enabled,
+        early_layers=args.staged_depth_early_layers,
+        switch_step=staged_depth_switch_step,
+        ramp_steps=args.staged_depth_ramp_steps,
+    )
     for module in base_model.modules():
         if isinstance(module, CastedLinear):
             module.float()
@@ -1066,6 +1139,10 @@ def main() -> None:
         f"iterations:{args.iterations} warmup_steps:{args.warmup_steps} "
         f"max_wallclock_seconds:{args.max_wallclock_seconds:.3f}"
     )
+    log0(
+        f"staged_depth:enabled={args.staged_depth_enabled} early_layers={args.staged_depth_early_layers} "
+        f"switch_step={staged_depth_switch_step} ramp_steps={args.staged_depth_ramp_steps}"
+    )
     log0(f"seed:{args.seed}")
 
     # DATA LOADER & MODEL WARMUP
@@ -1107,6 +1184,7 @@ def main() -> None:
             for micro_step in range(grad_accum_steps):
                 if distributed:
                     model.require_backward_grad_sync = micro_step == grad_accum_steps - 1
+                base_model.set_staged_depth_step(0)
                 x, y = train_loader.next_batch(args.train_batch_tokens, args.train_seq_len, grad_accum_steps)
                 with torch.autocast(device_type="cuda", dtype=torch.bfloat16, enabled=True):
                     warmup_loss = model(x, y)
@@ -1169,6 +1247,7 @@ def main() -> None:
         for micro_step in range(grad_accum_steps):
             if distributed:
                 model.require_backward_grad_sync = micro_step == grad_accum_steps - 1
+            base_model.set_staged_depth_step(step)
             x, y = train_loader.next_batch(args.train_batch_tokens, args.train_seq_len, grad_accum_steps)
             with torch.autocast(device_type="cuda", dtype=torch.bfloat16, enabled=True):
                 loss = model(x, y)
