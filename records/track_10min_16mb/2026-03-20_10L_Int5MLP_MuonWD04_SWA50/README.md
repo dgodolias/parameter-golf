@@ -40,12 +40,14 @@ The next wave is intentionally narrow:
 
 1. `FA3` attention backend
 2. `NorMuon` optimizer branch
-3. only if both show promise, combined `FA3 + NorMuon`
+3. `SwiGLU` MLP branch on the frozen control
+4. only if two independent branches show promise, combined candidates
 
 The baseline path remains unchanged when:
 
 - `ATTN_BACKEND=flash2`
 - `OPTIMIZER_KIND=muon`
+- `MLP_KIND=relu_sq`
 
 ### Attention backend switch
 
@@ -68,6 +70,19 @@ The record now supports:
 - `OPTIMIZER_KIND=normuon`
 
 First-pass NorMuon uses the same control geometry and LR structure as the control candidate. No hidden retuning is baked into the code path.
+
+### MLP switch
+
+The record now supports:
+
+- `MLP_KIND=relu_sq`
+- `MLP_KIND=swiglu`
+
+The `swiglu` branch uses an approximately iso-parameter hidden width by default:
+
+- effective hidden width = `(2/3) * MLP_MULT * model_dim` when `SWIGLU_HIDDEN_MULT` is unset
+
+This keeps the branch close to the current byte budget while giving it a real architectural identity beyond tuning.
 
 ## Environment Discipline
 
@@ -109,6 +124,7 @@ Experimental branches:
 - `.env.cloud1gpu_fa3_2048_524288`
 - `.env.cloud1gpu_normuon_2048_524288`
 - `.env.cloud1gpu_fa3_normuon_2048_524288`
+- `.env.cloud1gpu_swiglu_2048_524288`
 
 Historical references kept for diagnosis only:
 
@@ -143,6 +159,13 @@ Combined run:
 
 ```bash
 cp records/track_10min_16mb/2026-03-20_10L_Int5MLP_MuonWD04_SWA50/.env.cloud1gpu_fa3_normuon_2048_524288 \
+   records/track_10min_16mb/2026-03-20_10L_Int5MLP_MuonWD04_SWA50/.env
+```
+
+SwiGLU run:
+
+```bash
+cp records/track_10min_16mb/2026-03-20_10L_Int5MLP_MuonWD04_SWA50/.env.cloud1gpu_swiglu_2048_524288 \
    records/track_10min_16mb/2026-03-20_10L_Int5MLP_MuonWD04_SWA50/.env
 ```
 

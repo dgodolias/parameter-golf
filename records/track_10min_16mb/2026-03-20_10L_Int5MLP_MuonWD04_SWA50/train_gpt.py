@@ -102,6 +102,8 @@ class Hyperparameters:
     model_dim = int(os.environ.get("MODEL_DIM", 512))
     num_heads = int(os.environ.get("NUM_HEADS", 8))
     mlp_mult = float(os.environ.get("MLP_MULT", 3.0))
+    mlp_kind = os.environ.get("MLP_KIND", "relu_sq").strip().lower()
+    swiglu_hidden_mult = float(os.environ.get("SWIGLU_HIDDEN_MULT", 0.0))
     tie_embeddings = bool(int(os.environ.get("TIE_EMBEDDINGS", "1")))
     rope_base = float(os.environ.get("ROPE_BASE", 10000.0))
     logit_softcap = float(os.environ.get("LOGIT_SOFTCAP", 30.0))
@@ -749,14 +751,28 @@ class CausalSelfAttention(nn.Module):
 
 
 class MLP(nn.Module):
-    def __init__(self, dim: int, mlp_mult: float):
+    def __init__(self, dim: int, mlp_mult: float, mlp_kind: str, swiglu_hidden_mult: float):
         super().__init__()
-        hidden = int(mlp_mult * dim)
-        self.fc = CastedLinear(dim, hidden, bias=False)
+        if mlp_kind not in {"relu_sq", "swiglu"}:
+            raise ValueError(f"MLP_KIND must be one of relu_sq|swiglu, got {mlp_kind}")
+        self.mlp_kind = mlp_kind
+        if mlp_kind == "swiglu":
+            hidden_mult = swiglu_hidden_mult if swiglu_hidden_mult > 0.0 else ((2.0 / 3.0) * mlp_mult)
+            hidden = max(1, int(hidden_mult * dim))
+            self.fc = CastedLinear(dim, hidden, bias=False)
+            self.gate = CastedLinear(dim, hidden, bias=False)
+        else:
+            hidden = int(mlp_mult * dim)
+            self.fc = CastedLinear(dim, hidden, bias=False)
+            self.gate = None
+        self.hidden = hidden
         self.proj = CastedLinear(hidden, dim, bias=False)
         self.proj._zero_init = True
 
     def forward(self, x: Tensor) -> Tensor:
+        if self.mlp_kind == "swiglu":
+            x = F.silu(self.gate(x)) * self.fc(x)
+            return self.proj(x)
         x = torch.relu(self.fc(x))
         return self.proj(x.square())
 
@@ -807,6 +823,8 @@ class Block(nn.Module):
         num_heads: int,
         num_kv_heads: int,
         mlp_mult: float,
+        mlp_kind: str,
+        swiglu_hidden_mult: float,
         rope_base: float,
         qk_gain_init: float,
         attn_qk_softcap: float,
@@ -816,7 +834,7 @@ class Block(nn.Module):
         self.attn_norm = RMSNorm()
         self.mlp_norm = RMSNorm()
         self.attn = CausalSelfAttention(dim, num_heads, num_kv_heads, rope_base, qk_gain_init, attn_qk_softcap, attn_backend)
-        self.mlp = MLP(dim, mlp_mult)
+        self.mlp = MLP(dim, mlp_mult, mlp_kind, swiglu_hidden_mult)
         self.attn_scale = nn.Parameter(torch.ones(dim, dtype=torch.float32))
         self.mlp_scale = nn.Parameter(torch.ones(dim, dtype=torch.float32))
         self.resid_mix = nn.Parameter(torch.stack((torch.ones(dim), torch.zeros(dim))).float())
@@ -839,6 +857,8 @@ class GPT(nn.Module):
         num_heads: int,
         num_kv_heads: int,
         mlp_mult: float,
+        mlp_kind: str,
+        swiglu_hidden_mult: float,
         tie_embeddings: bool,
         tied_embed_init_std: float,
         logit_softcap: float,
@@ -864,7 +884,18 @@ class GPT(nn.Module):
         self.smear = SmearGate(model_dim)
         self.blocks = nn.ModuleList(
             [
-                Block(model_dim, num_heads, num_kv_heads, mlp_mult, rope_base, qk_gain_init, attn_qk_softcap, attn_backend)
+                Block(
+                    model_dim,
+                    num_heads,
+                    num_kv_heads,
+                    mlp_mult,
+                    mlp_kind,
+                    swiglu_hidden_mult,
+                    rope_base,
+                    qk_gain_init,
+                    attn_qk_softcap,
+                    attn_backend,
+                )
                 for _ in range(num_layers)
             ]
         )
@@ -1231,6 +1262,8 @@ def main() -> None:
         num_heads=args.num_heads,
         num_kv_heads=args.num_kv_heads,
         mlp_mult=args.mlp_mult,
+        mlp_kind=args.mlp_kind,
+        swiglu_hidden_mult=args.swiglu_hidden_mult,
         tie_embeddings=args.tie_embeddings,
         tied_embed_init_std=args.tied_embed_init_std,
         logit_softcap=args.logit_softcap,
@@ -1344,6 +1377,7 @@ def main() -> None:
         f"optimizer_kind:{args.optimizer_kind} muon_momentum:{args.muon_momentum} "
         f"normuon_beta2:{args.normuon_beta2} normuon_eps:{args.normuon_eps}"
     )
+    log0(f"mlp_kind:{args.mlp_kind} swiglu_hidden_mult:{args.swiglu_hidden_mult}")
     log0(f"attention_mode:gqa num_heads:{args.num_heads} num_kv_heads:{args.num_kv_heads}")
     log0(
         f"tie_embeddings:{args.tie_embeddings} embed_lr:{token_lr} "
