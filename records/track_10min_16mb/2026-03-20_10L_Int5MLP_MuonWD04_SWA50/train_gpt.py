@@ -132,6 +132,9 @@ class Hyperparameters:
     staged_depth_early_layers = int(os.environ.get("STAGED_DEPTH_EARLY_LAYERS", 8))
     staged_depth_switch_frac = float(os.environ.get("STAGED_DEPTH_SWITCH_FRAC", 0.15))
     staged_depth_ramp_steps = int(os.environ.get("STAGED_DEPTH_RAMP_STEPS", 200))
+    late_layer_ramp_enabled = bool(int(os.environ.get("LATE_LAYER_RAMP_ENABLED", "0")))
+    late_layer_ramp_layers = int(os.environ.get("LATE_LAYER_RAMP_LAYERS", 2))
+    late_layer_ramp_init = float(os.environ.get("LATE_LAYER_RAMP_INIT", -2.0))
 
 # -----------------------------
 # MUON OPTIMIZER
@@ -720,12 +723,25 @@ class GPT(nn.Module):
         self.lm_head = None if tie_embeddings else CastedLinear(model_dim, vocab_size, bias=False)
         if self.lm_head is not None:
             self.lm_head._zero_init = True
+        self.late_layer_ramp_enabled = False
+        self.late_layer_ramp_start_idx = num_layers
+        self.late_layer_ramp_logits = nn.Parameter(torch.empty(0, dtype=torch.float32))
         self.staged_depth_enabled = False
         self.staged_depth_early_layers = num_layers
         self.staged_depth_switch_step = 0
         self.staged_depth_ramp_steps = 0
         self._staged_depth_current_step = 0
         self._init_weights()
+
+    def configure_late_layer_ramp(self, *, enabled: bool, late_layers: int, init: float) -> None:
+        self.late_layer_ramp_enabled = enabled and late_layers > 0
+        if not self.late_layer_ramp_enabled:
+            self.late_layer_ramp_start_idx = len(self.blocks)
+            self.late_layer_ramp_logits = nn.Parameter(torch.empty(0, dtype=torch.float32))
+            return
+        late_layers = min(max(1, late_layers), len(self.blocks))
+        self.late_layer_ramp_start_idx = len(self.blocks) - late_layers
+        self.late_layer_ramp_logits = nn.Parameter(torch.full((late_layers,), init, dtype=torch.float32))
 
     def configure_staged_depth(
         self,
@@ -765,6 +781,14 @@ class GPT(nn.Module):
         alpha_t = x.new_tensor(alpha)
         return x + (block_out - x) * alpha_t
 
+    def _apply_block_with_gain(self, block_idx: int, x: Tensor, x0: Tensor) -> Tensor:
+        if not self.late_layer_ramp_enabled or block_idx < self.late_layer_ramp_start_idx:
+            return self.blocks[block_idx](x, x0)
+        gate_idx = block_idx - self.late_layer_ramp_start_idx
+        block_out = self.blocks[block_idx](x, x0)
+        gain = torch.sigmoid(self.late_layer_ramp_logits[gate_idx]).to(dtype=x.dtype)
+        return x + (block_out - x) * gain
+
     def _init_weights(self) -> None:
         if self.tie_embeddings:
             nn.init.normal_(self.tok_emb.weight, mean=0.0, std=self.tied_embed_init_std)
@@ -789,14 +813,23 @@ class GPT(nn.Module):
         skips: list[Tensor] = []
         active_encoder_layers, active_decoder_layers, ramp_alpha = self._staged_depth_state()
         for i in range(self.num_encoder_layers):
-            alpha = 1.0 if i < active_encoder_layers else ramp_alpha
-            x = self._apply_block_with_alpha(self.blocks[i], x, x0, alpha)
+            if i < active_encoder_layers:
+                x = self._apply_block_with_gain(i, x, x0)
+            else:
+                block_out = self._apply_block_with_gain(i, x, x0)
+                alpha_t = x.new_tensor(ramp_alpha)
+                x = x + (block_out - x) * alpha_t
             skips.append(x)
         for i in range(self.num_decoder_layers):
             if skips:
                 x = x + self.skip_weights[i].to(dtype=x.dtype)[None, None, :] * skips.pop()
-            alpha = 1.0 if i < active_decoder_layers else ramp_alpha
-            x = self._apply_block_with_alpha(self.blocks[self.num_encoder_layers + i], x, x0, alpha)
+            block_idx = self.num_encoder_layers + i
+            if i < active_decoder_layers:
+                x = self._apply_block_with_gain(block_idx, x, x0)
+            else:
+                block_out = self._apply_block_with_gain(block_idx, x, x0)
+                alpha_t = x.new_tensor(ramp_alpha)
+                x = x + (block_out - x) * alpha_t
         x = self.final_norm(x).reshape(-1, x.size(-1))
         targets = target_ids.reshape(-1)
         if self.tie_embeddings:
@@ -818,14 +851,23 @@ class GPT(nn.Module):
         skips: list[Tensor] = []
         active_encoder_layers, active_decoder_layers, ramp_alpha = self._staged_depth_state()
         for i in range(self.num_encoder_layers):
-            alpha = 1.0 if i < active_encoder_layers else ramp_alpha
-            x = self._apply_block_with_alpha(self.blocks[i], x, x0, alpha)
+            if i < active_encoder_layers:
+                x = self._apply_block_with_gain(i, x, x0)
+            else:
+                block_out = self._apply_block_with_gain(i, x, x0)
+                alpha_t = x.new_tensor(ramp_alpha)
+                x = x + (block_out - x) * alpha_t
             skips.append(x)
         for i in range(self.num_decoder_layers):
             if skips:
                 x = x + self.skip_weights[i].to(dtype=x.dtype)[None, None, :] * skips.pop()
-            alpha = 1.0 if i < active_decoder_layers else ramp_alpha
-            x = self._apply_block_with_alpha(self.blocks[self.num_encoder_layers + i], x, x0, alpha)
+            block_idx = self.num_encoder_layers + i
+            if i < active_decoder_layers:
+                x = self._apply_block_with_gain(block_idx, x, x0)
+            else:
+                block_out = self._apply_block_with_gain(block_idx, x, x0)
+                alpha_t = x.new_tensor(ramp_alpha)
+                x = x + (block_out - x) * alpha_t
         x = self.final_norm(x)
         if self.tie_embeddings:
             logits_proj = F.linear(x, self.tok_emb.weight)
@@ -1043,6 +1085,11 @@ def main() -> None:
         switch_step=staged_depth_switch_step,
         ramp_steps=args.staged_depth_ramp_steps,
     )
+    base_model.configure_late_layer_ramp(
+        enabled=args.late_layer_ramp_enabled,
+        late_layers=args.late_layer_ramp_layers,
+        init=args.late_layer_ramp_init,
+    )
     for module in base_model.modules():
         if isinstance(module, CastedLinear):
             module.float()
@@ -1129,6 +1176,10 @@ def main() -> None:
     log0(
         f"staged_depth:enabled={args.staged_depth_enabled} early_layers={args.staged_depth_early_layers} "
         f"switch_step={staged_depth_switch_step} ramp_steps={args.staged_depth_ramp_steps}"
+    )
+    log0(
+        f"late_layer_ramp:enabled={args.late_layer_ramp_enabled} layers={args.late_layer_ramp_layers} "
+        f"init={args.late_layer_ramp_init}"
     )
     log0(f"seed:{args.seed}")
 
