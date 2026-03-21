@@ -122,12 +122,38 @@ This branch now treats `2026-03-20_10L_Int5MLP_MuonWD04_SWA50` as the only activ
 
 The first active runtime track is:
 
-1. `COMPILE_MODEL=1`, `COMPILE_FULLGRAPH=1`
-2. `COMPILE_MODEL=1`, `COMPILE_FULLGRAPH=0`
-3. `COMPILE_MODEL=0`, `COMPILE_MUON_BACKEND=1`
-4. `COMPILE_MODEL=0`, `COMPILE_MUON_BACKEND=0`
+1. `COMPILE_MODEL=1`, `COMPILE_FULLGRAPH=1` -> rejected (`~79s` startup, `~285s` to step 250)
+2. `COMPILE_MODEL=1`, `COMPILE_FULLGRAPH=0` -> rejected (same slow regime)
+3. `COMPILE_MODEL=0`, `COMPILE_MUON_BACKEND=1` -> rejected (hit `600s` cap at step `243`)
+4. `COMPILE_MODEL=0`, `COMPILE_MUON_BACKEND=0` -> promoted (`~47.5s` startup, `~253.35s` to step 250, `train_loss@250 ~2.8615`)
 
-Only after the best runtime-safe path is clear do we promote score-side experiments around WD, momentum warmup, SWA, and bigram capacity.
+The active cloud default now uses Variant 4. Only after the best runtime-safe path is clear do we promote score-side experiments around WD, momentum warmup, SWA, and bigram capacity.
+
+## First Aggressive Score Wave
+
+All runs below used the runtime-safe local path:
+
+- `COMPILE_MODEL=0`
+- `COMPILE_MUON_BACKEND=0`
+- `WARMUP_STEPS=0`
+- `VAL_LOSS_EVERY=0`
+
+Local smoke/proxy results (`seq_len=1024`, `60` iters, `MAX_VAL_SEQS=64`):
+
+| Variant | final val_loss | final val_bpb | step60 train_time |
+|--------|---------------:|--------------:|------------------:|
+| baseline repro (`WD=0.04`, `MUON_MOMENTUM_WARMUP_STEPS=1500`) | 5.73303789 | 3.39322023 | 35355ms |
+| `WEIGHT_DECAY=0.03` | 5.73302136 | 3.39321044 | 35224ms |
+| `WEIGHT_DECAY=0.05` | 5.73305689 | 3.39323147 | 35272ms |
+| `MUON_MOMENTUM_WARMUP_STEPS=1000` | 5.73304742 | 3.39322587 | 35298ms |
+| `MUON_MOMENTUM_WARMUP_STEPS=2000` | 5.73304748 | 3.39322590 | 35236ms |
+
+Interpretation:
+
+- `WEIGHT_DECAY=0.03` is a tiny local edge, but effectively a tie.
+- `WEIGHT_DECAY=0.05` is worse.
+- `MUON_MOMENTUM_WARMUP_STEPS=1000/2000` did not improve the local proxy.
+- No score-side promotion yet from this first wave; the baseline hyperparameters remain the active score reference.
 
 ## 3-Seed Results
 
