@@ -163,9 +163,8 @@ def attention_impl(q: Tensor, k: Tensor, v: Tensor, num_heads: int, num_kv_heads
         repeat = num_heads // num_kv_heads
         k_t = k_t.repeat_interleave(repeat, dim=1)
         v_t = v_t.repeat_interleave(repeat, dim=1)
-    from torch.nn.attention import SDPBackend, sdpa_kernel
-    with sdpa_kernel(SDPBackend.MATH):
-        y = F.scaled_dot_product_attention(q_t, k_t, v_t, is_causal=True)
+    # Keep the non-FA3 fallback compile-safe for TorchDynamo.
+    y = F.scaled_dot_product_attention(q_t, k_t, v_t, is_causal=True)
     return y.transpose(1, 2)
 
 # --- Batched Newton-Schulz orthogonalization ---
